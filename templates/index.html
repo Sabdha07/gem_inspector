@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Genome-scale Model Inspector</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>Genome-scale Model Inspector</h1>
+    <p>Upload a COBRA model → inspect structure, objective, exchanges, and exchange essentiality.</p>
+  </div>
+</header>
+
+<main class="container">
+  <section class="upload-card">
+    <label class="dropzone" id="dropzone">
+      <input id="modelFile" type="file" accept=".xml,.sbml,.json,.yml,.yaml,.mat,.gz,.zip,.bz2">
+      <strong>Drop a model here</strong>
+      <span>or click to choose SBML/XML, JSON, YAML, MATLAB or compressed SBML</span>
+    </label>
+
+    <div class="diet-control">
+      <label for="dietMode">Diet / media</label>
+      <select id="dietMode">
+        <option value="none" selected>Model's original bounds (no diet)</option>
+        <option value="complete">Complete media (open all exchanges)</option>
+        <option value="minimal">Minimal media (computed)</option>
+        <option value="custom">Custom diet (upload file)</option>
+      </select>
+      <label class="dropzone dropzone-inline hidden" id="dietDropzone">
+        <input id="dietFile" type="file" accept=".csv,.tsv,.txt">
+        <strong>Drop a diet file here</strong>
+        <span>or click to choose a CSV/TSV of (metabolite or exchange id, flux)</span>
+      </label>
+      <span id="dietFilename"></span>
+    </div>
+
+    <button id="analyzeBtn" disabled>Analyze model</button>
+    <span id="filename"></span>
+    <span id="status"></span>
+  </section>
+
+  <section id="app" class="hidden">
+    <div class="summary" id="summary"></div>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="reactions">Reactions</button>
+      <button class="tab" data-tab="metabolites">Metabolites</button>
+      <button class="tab" data-tab="exchanges">Exchange essentiality</button>
+      <button class="tab" data-tab="objective">Objective</button>
+      <button class="tab" data-tab="debug" id="debugTab" style="display:none;">Exchange Debugging</button>
+      <button class="tab" data-tab="tracer">Pathway Tracer</button>
+    </nav>
+
+    <section id="overview" class="panel active"></section>
+    <section id="reactions" class="panel"></section>
+    <section id="metabolites" class="panel"></section>
+    <section id="exchanges" class="panel"></section>
+    <section id="objective" class="panel"></section>
+    <section id="debug" class="panel"></section>
+    <section id="tracer" class="panel"></section>
+  </section>
+</main>
+
+<script src="/static/vendor/cytoscape.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+Flask>=3.0,<4
+cobra>=0.31,<0.32
+python-libsbml>=5.20
