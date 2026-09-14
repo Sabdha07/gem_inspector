@@ -46,11 +46,20 @@ A small local Flask + COBRApy UI for inspecting a genome-scale metabolic model.
     - **Complete media** — every exchange opened to unrestricted uptake
     - **Minimal media** — the smallest set of nutrients (via `cobra.medium.minimal_medium`) that sustains the model's own maximum growth rate
     - **Custom diet** — upload a CSV/TSV of `(id, flux)` pairs; ids may be an exchange reaction id, or a metabolite id in a *different* compartment-tag convention than the model itself (e.g. diet says `glc_D_e`, model uses `glc_D_e0`) — entries are matched by compartment-stripped base id, and anything that still can't be matched is reported rather than silently dropped
-11. Pathway Tracer (on request, general-purpose — not tied to biomass or exchanges):
+11. Minimal Medium tab (on request, as soon as the model loads — separate from the "Minimal media" diet option above):
+    - non-destructively reports the smallest nutrient set sustaining a chosen **growth cutoff** — any fraction from just above 0% up to 100% of the model's own maximum growth rate, not only 100%
+    - never changes the model being analyzed elsewhere in the app, so it can be recomputed for a different cutoff at any time
+    - shows each exchange reaction, its metabolite, and the uptake flux required
+12. Pathway Tracer (on request, general-purpose — not tied to biomass or exchanges):
     - trace active-flux paths from any starting point (a metabolite, or a reaction resolved to its current-flux products) to any target metabolite
     - configurable "levels" (BFS depth) and max number of paths returned
     - currency/cofactor metabolites excluded by default, same rule and toggle as exchange debugging
     - two view modes: a text/words view, and an interactive, filterable Cytoscape.js network graph (filter by subsystem, minimum flux magnitude, or search/highlight)
+13. Network Gaps & Audits (on request, as soon as the model loads):
+    - **Blocked reactions** — reactions that cannot carry any flux under the model's current bounds
+    - **Dead-end metabolites** — metabolites that can only ever be produced or only ever be consumed given their reactions' current bounds/reversibility
+    - **Demand & sink audit** — every demand/sink reaction's bounds, WT usage, and knockout essentiality
+    - all three tables sortable and independently exportable to CSV
 
 ## Essentiality definition
 
@@ -118,6 +127,26 @@ A custom diet file needs at least two columns: an identifier and a flux value. F
 - A bare compound id with no compartment tag at all (`glc_D`), assumed extracellular
 
 Whatever couldn't be matched is listed on the Overview tab rather than silently ignored.
+
+The target growth used for "Minimal media" (both this diet option and the Minimal Medium tab below) is always the model's own maximum growth rate under its own original bounds exactly as uploaded — never a growth rate computed after forcing every exchange open, which would let FBA route flux through byproduct/secretion exchanges run in reverse and inflate the target to a biologically unrealistic value.
+
+## Minimal Medium tab
+
+A separate, read-only, on-request report — visible as its own tab as soon as the model loads, independent of whatever diet was chosen before analysis. Pick a **growth cutoff** (a fraction from just above 0 up to 1.0 — the default 1.0 uses the model's full own maximum growth rate, 0.5 asks for half of it, etc.) and click **Compute minimal medium** to see the smallest exchange-reaction set that sustains that fraction of growth, one row per component with separate **exchange reaction name**, **exchange reaction ID**, **metabolite ID**, **metabolite name**, and **flux** columns — sortable by any of them, and exportable to CSV via the button above the table.
+
+It never changes the model being analyzed elsewhere in the app (see the note on numerical robustness below); recompute it for a different cutoff as often as you like without needing to re-run the initial analysis.
+
+## Network Gaps & Audits tab
+
+A separate, on-request tab — visible as soon as the model loads — with three independent diagnostics, each its own button, each sortable and independently exportable to CSV, none of which ever change the analyzed model:
+
+- **Blocked reactions** — reactions that cannot carry any flux at all, via COBRApy's flux-variability-based `find_blocked_reactions`. Run with the model's real bounds (not artificially opened), so the result reflects the diet actually in effect. Can take a while for large models since it runs flux variability analysis on every reaction that carries no flux in the current solution; runs on GLPK's exact-arithmetic solver internally (see the numerical-robustness note below) to avoid a crash some GLPK builds hit when re-solving the same LP many times in a row.
+- **Dead-end metabolites** — a fast, purely structural check (no optimization involved) for metabolites that, given each of their reactions' current bounds/reversibility, can only ever be produced or only ever be consumed — never both. This is often *why* a reaction ends up blocked, though a reaction can also be blocked for more global network reasons a local per-metabolite check can't see, which is why this and the blocked-reactions check are shown together rather than one substituting for the other.
+- **Demand & sink audit** — every demand and sink reaction (`model.demands` / `model.sinks` — single-metabolite boundary reactions distinct from exchanges, so they don't appear in the Exchange essentiality tab) with its metabolite, bounds, whether it carries flux in the current FBA solution, and the same reaction-knockout essentiality test used for exchanges (KO growth < 5% of WT growth). A demand/sink that's unused and non-essential is a reasonable candidate for pruning; one that's unused but silently essential can be a sign of an over-permissive reaction papering over a thermodynamically unrealistic loop.
+
+## Numerical robustness note (GLPK on Windows)
+
+Two operations in this app — "Minimal media" (both the diet option and the Minimal Medium tab) and the Network Gaps tab's blocked-reactions check — have been observed to trigger a fatal `glp_free: memory allocation error` crash on some GLPK/Windows builds: one from solving a single very poorly-scaled LP (forcing every exchange wide open), the other from re-solving the same LP many times in a row (flux variability analysis). Because this is a crash inside GLPK's own C code, Python cannot catch or recover from it — it takes down the whole server process. Both operations now run on GLPK's exact-arithmetic interface (`glpk_exact`) instead of the default floating-point solver, which sidesteps both failure modes (COBRApy's own `minimal_medium` docs list "switching to a different solver" as the standard remedy for numerical instability). The trade-off is slower solves for these two specific computations; everything else in the app keeps using the fast default solver.
 
 ## Notes
 

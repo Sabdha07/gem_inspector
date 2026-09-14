@@ -23,6 +23,7 @@ from cobra.io import (
     load_yaml_model,
     read_sbml_model,
 )
+from cobra.flux_analysis import find_blocked_reactions
 from cobra.medium import minimal_medium
 from cobra.util import linear_reaction_coefficients
 
@@ -543,6 +544,51 @@ def find_biomass_reaction(model):
 # bounds) is left as defined in the uploaded model.
 # ---------------------------------------------------------------------------
 
+def run_with_exact_solver(model, fn):
+    """Run fn() with the model's solver temporarily switched to GLPK's
+    exact-arithmetic interface ("glpk_exact"), then always switch back to
+    whatever interface the model was using before -- even if fn() raises.
+
+    Why: cobra.medium.minimal_medium's open_exchanges=True path force-opens
+    every exchange reaction to (-1000, 1000), which for a genome-scale model
+    with a wide range of stoichiometric coefficients can produce a very
+    poorly scaled LP. The default GLPK solver runs a floating-point
+    scaling/factorization step for problems like that, and on some GLPK
+    builds (this has been seen on Windows) a badly-scaled problem can
+    trigger a fatal, unrecoverable crash in GLPK's own memory allocator
+    ("glp_free: memory allocation error") -- a C-level abort that takes the
+    whole Python process down with it, so no amount of try/except around
+    the call can catch it. glpk_exact uses exact rational arithmetic and
+    skips floating-point scaling entirely, avoiding that failure mode
+    (cobra's own minimal_medium docs list "switching to a different solver"
+    as the recommended remedy for numerical instability here). It's slower,
+    so it's only used for the specific computation passed in, not globally.
+    """
+    try:
+        original = model.solver.interface.__name__.split(".")[-1].split("_interface")[0]
+    except Exception:
+        original = None
+
+    if original == "glpk_exact":
+        return fn()
+
+    switched = False
+    if original is not None:
+        try:
+            model.solver = "glpk_exact"
+            switched = True
+        except Exception:
+            switched = False  # glpk_exact unavailable -- fall back to running as-is
+
+    try:
+        return fn()
+    finally:
+        if switched:
+            try:
+                model.solver = original
+            except Exception:
+                pass
+
 def build_exchange_index(model):
     """Map an exchange reaction's own id, its single metabolite's full id,
     and that metabolite's compartment-stripped base id, all lowercased, to
@@ -644,23 +690,31 @@ def apply_diet_to_model(model, mode, diet_entries=None):
         }
 
     if mode == "minimal":
-        # Match the (-1000, 1000) bound magnitude that minimal_medium's own
-        # open_exchanges=True uses below, so the growth target we solve for
-        # here is actually achievable when it computes the minimal set.
-        with model:
-            for exch in model.exchanges:
-                exch.bounds = (-1000.0, 1000.0)
-            target_growth = safe_float(model.slim_optimize(error_value=0.0)) or 0.0
+        # The target is the model's OWN maximum growth rate, under its own
+        # original bounds exactly as uploaded. Bug fix: this used to force
+        # every exchange bound open to (-1000, 1000) *before* measuring the
+        # "model's own maximum growth", which lets FBA route flux through
+        # byproduct/secretion exchanges run in reverse (no thermodynamic
+        # constraints stop it) and inflates the target to a biologically
+        # meaningless value -- e.g. ~47x too high on the bundled E. coli core
+        # test model (40.85 vs the model's real 0.87 h^-1). minimal_medium's
+        # own open_exchanges=True below already searches over every exchange
+        # (temporarily, inside its own model context) while solving for
+        # whatever target we pass it, so it doesn't need us to open anything
+        # first -- doing so only changes what target we ask it to hit.
+        target_growth = safe_float(model.slim_optimize(error_value=0.0)) or 0.0
 
         if target_growth <= 1e-9:
             return {
                 "mode": "minimal", "applied": [], "unmatched": [],
-                "note": "Model cannot grow even with every exchange open; a minimal medium is undefined.",
+                "note": "Model cannot grow under its own original bounds; a minimal medium is undefined.",
                 "error": True,
             }
 
         try:
-            medium = minimal_medium(model, target_growth, minimize_components=False, open_exchanges=True)
+            medium = run_with_exact_solver(
+                model, lambda: minimal_medium(model, target_growth, minimize_components=False, open_exchanges=True)
+            )
         except Exception as exc:
             return {
                 "mode": "minimal", "applied": [], "unmatched": [],
@@ -702,6 +756,96 @@ def apply_diet_to_model(model, mode, diet_entries=None):
     if unmatched:
         note += f" {len(unmatched)} entries could not be matched to an exchange reaction in this model (shown below)."
     return {"mode": "custom", "applied": applied, "unmatched": unmatched, "note": note}
+
+# ---------------------------------------------------------------------------
+# On-request "Minimal Medium" tab.
+#
+# Separate from the diet applied at upload time (mode == "minimal" above,
+# which permanently constrains the analyzed model to that computed medium):
+# this is a read-only, repeatable report the user can (re)run for any growth
+# cutoff after the model is loaded, without ever changing the cached model's
+# bounds. Shares the same underlying cobra.medium.minimal_medium call and the
+# same "target is the model's own growth, not an artificially opened one" fix
+# described above.
+# ---------------------------------------------------------------------------
+
+def compute_minimal_medium_report(model, growth_cutoff_fraction=1.0, minimize_components=False):
+    """Compute the minimal medium needed to sustain growth_cutoff_fraction of
+    the model's own maximum growth rate (under its own original bounds).
+    cobra's minimal_medium() already manages open_exchanges internally and
+    leaves the model's own bounds completely unchanged when it returns, so
+    this never permanently changes the cached model -- and deliberately does
+    NOT add its own extra `with model:` around that call (an earlier version
+    did, "just to be safe"; nesting a redundant context manager around
+    minimal_medium's own reentrant optimize() calls could corrupt the GLPK
+    solver's internal memory and crash the whole process). growth_cutoff_fraction
+    is clamped to (0, 1] -- 1.0 means the model's full own maximum growth,
+    0.5 means half of it, etc.
+
+    Returns a dict with wt_growth, growth_cutoff_fraction, target_growth,
+    components (a list of {exchange_id, exchange_name, metabolite_id,
+    metabolite_name, uptake_flux}, sorted by exchange id), and a note; or an
+    "error" key (alongside wt_growth, when known) on failure.
+    """
+    wt_growth = safe_float(model.slim_optimize(error_value=0.0)) or 0.0
+    if wt_growth <= 1e-9:
+        return {
+            "error": "Model cannot grow under its own original bounds; a minimal medium is undefined.",
+            "wt_growth": wt_growth,
+        }
+
+    try:
+        growth_cutoff_fraction = float(growth_cutoff_fraction)
+    except (TypeError, ValueError):
+        growth_cutoff_fraction = 1.0
+    growth_cutoff_fraction = max(1e-6, min(1.0, growth_cutoff_fraction))
+    target_growth = wt_growth * growth_cutoff_fraction
+
+    # minimal_medium() already leaves the model's own bounds completely
+    # unchanged on its own (verified: it manages open_exchanges internally
+    # and restores everything before returning) -- no outer `with model:` is
+    # needed, and nesting one around it here previously caused reentrant
+    # calls into the solver that could corrupt GLPK's internal memory
+    # ("glp_free: memory allocation error"), crashing the whole server.
+    try:
+        medium = run_with_exact_solver(
+            model,
+            lambda: minimal_medium(model, target_growth, minimize_components=minimize_components, open_exchanges=True),
+        )
+    except Exception as exc:
+        return {"error": f"Could not compute a minimal medium: {exc}", "wt_growth": wt_growth}
+    if medium is None:
+        return {
+            "error": f"Minimal-medium computation was infeasible at a {growth_cutoff_fraction * 100:.4g}% growth cutoff.",
+            "wt_growth": wt_growth,
+        }
+
+    components = []
+    for rxn_id, flux in medium.items():
+        if flux <= 0:
+            continue
+        rxn = model.reactions.get_by_id(rxn_id)
+        met = next(iter(rxn.metabolites.keys()), None)
+        components.append({
+            "exchange_id": rxn_id,
+            "exchange_name": rxn.name,
+            "metabolite_id": met.id if met else None,
+            "metabolite_name": clean_metabolite_display_name(met) if met else None,
+            "uptake_flux": abs(safe_float(flux) or 0.0),
+        })
+    components.sort(key=lambda c: c["exchange_id"])
+
+    return {
+        "wt_growth": wt_growth,
+        "growth_cutoff_fraction": growth_cutoff_fraction,
+        "target_growth": target_growth,
+        "components": components,
+        "note": (
+            f"Smallest set of {len(components)} nutrient(s) sustaining "
+            f"{growth_cutoff_fraction * 100:.4g}% of the model's own maximum growth rate "
+            f"({target_growth:.4g} of {wt_growth:.4g})."
+        ),
+    }
 
 # ---------------------------------------------------------------------------
 # Shared active-flux pathway tracing helpers.
@@ -1078,6 +1222,244 @@ def apply_knockouts(model, resolved_targets):
         model.reactions.get_by_id(rid).knock_out()
     return rxn_ids
 
+# ---------------------------------------------------------------------------
+# Network Gaps tab (on-request, as soon as the model loads).
+#
+# Two complementary diagnostics for spotting network-connectivity gaps
+# (dead-end/orphan metabolites, un-fillable pathways) under the model's
+# CURRENT bounds -- i.e. whatever diet was applied at upload time, exactly
+# as everything else in the app sees it:
+#   - Blocked reactions: reactions that cannot carry any flux at all, via
+#     cobra's own FVA-based find_blocked_reactions. open_exchanges is left
+#     False (unlike minimal_medium) so this uses the model's real current
+#     bounds rather than an artificially widened, poorly-scaled problem --
+#     the kind of thing that has been observed to destabilize GLPK on some
+#     builds (see run_with_exact_solver above). processes is pinned to 1:
+#     cobra's default parallel FVA spawns worker processes, and on Windows
+#     that uses the "spawn" start method, which re-pickles the model into a
+#     fresh interpreter for each worker -- fragile and slow to do from
+#     inside a live Flask request, so a single serial pass is used instead.
+#   - Dead-end metabolites: a fast, local, purely structural check (no LP
+#     solves at all) for metabolites that, given each of their reactions'
+#     current bounds/reversibility, can only ever be produced or only ever
+#     be consumed -- never both. That's often *why* a reaction ends up
+#     blocked, though a reaction can also be blocked for more global
+#     network reasons a local per-metabolite check can't see, which is why
+#     both diagnostics are shown together rather than one substituting for
+#     the other.
+# ---------------------------------------------------------------------------
+
+def find_dead_end_metabolites(model):
+    """Bounds-aware structural dead-end check (see module comment above).
+    Returns a list of {"id", "reason", "reactions"} for every metabolite
+    that can only ever be produced, only ever be consumed, or never either
+    (reason: "no_consuming_reaction", "no_producing_reaction", or
+    "fully_blocked"), plus any metabolite with no reactions at all
+    ("no_reactions" -- a data artifact, but worth surfacing)."""
+    produce_rxns, consume_rxns = {}, {}
+    for rxn in model.reactions:
+        lb, ub = rxn.lower_bound, rxn.upper_bound
+        for met, coeff in rxn.metabolites.items():
+            if coeff > 0:
+                if ub > 0:
+                    produce_rxns.setdefault(met.id, set()).add(rxn.id)
+                if lb < 0:
+                    consume_rxns.setdefault(met.id, set()).add(rxn.id)
+            elif coeff < 0:
+                if lb < 0:
+                    produce_rxns.setdefault(met.id, set()).add(rxn.id)
+                if ub > 0:
+                    consume_rxns.setdefault(met.id, set()).add(rxn.id)
+
+    dead_ends = []
+    for met in model.metabolites:
+        touching = sorted(r.id for r in met.reactions)
+        if not touching:
+            dead_ends.append({"id": met.id, "reason": "no_reactions", "reactions": []})
+            continue
+        can_produce = met.id in produce_rxns
+        can_consume = met.id in consume_rxns
+        if can_produce and can_consume:
+            continue
+        if can_produce:
+            reason = "no_consuming_reaction"
+        elif can_consume:
+            reason = "no_producing_reaction"
+        else:
+            reason = "fully_blocked"
+        dead_ends.append({"id": met.id, "reason": reason, "reactions": touching})
+    return dead_ends
+
+def compute_network_gaps_report(model, zero_cutoff=None):
+    """Combined report for the Network Gaps tab. Never changes the cached
+    model: find_blocked_reactions manages its own `with model:` internally,
+    and find_dead_end_metabolites only reads bounds/stoichiometry."""
+    reaction_types = classify_reactions(model)
+    compartment_names = {cid: compartment_display_name(cid, name) for cid, name in model.compartments.items()}
+
+    # Bug fix: find_blocked_reactions runs flux variability analysis, which
+    # (unlike a single slim_optimize call) re-solves the LP many times in a
+    # row -- one min and one max per candidate reaction -- reusing the same
+    # floating-point GLPK problem object each time. On this GLPK/Windows
+    # build that repeated-solve pattern has been observed to trigger the
+    # same fatal "glp_free: memory allocation error" crash as
+    # minimal_medium's single wide-open solve did (see run_with_exact_solver
+    # above) -- just from a different trigger (many solves vs. one poorly
+    # scaled one). Running it on glpk_exact avoids both failure modes; it's
+    # slower per solve, but find_blocked_reactions already pre-filters to
+    # only the reactions with near-zero flux in the current solution, so in
+    # practice this is far fewer solves than "every reaction x2".
+    try:
+        blocked_ids = run_with_exact_solver(
+            model, lambda: find_blocked_reactions(model, zero_cutoff=zero_cutoff, open_exchanges=False, processes=1)
+        )
+    except Exception as exc:
+        return {"error": f"Could not compute blocked reactions: {exc}"}
+
+    blocked_reactions = []
+    for rxn_id in sorted(blocked_ids):
+        rxn = model.reactions.get_by_id(rxn_id)
+        blocked_reactions.append({
+            "id": rxn.id,
+            "name": rxn.name,
+            "subsystem": subsystem_value(rxn),
+            "type": reaction_types.get(rxn.id, ""),
+            "reaction_string": rxn.reaction,
+            "lower_bound": safe_float(rxn.lower_bound),
+            "upper_bound": safe_float(rxn.upper_bound),
+            "gene_reaction_rule": getattr(rxn, "gene_reaction_rule", ""),
+        })
+
+    try:
+        dead_end_raw = find_dead_end_metabolites(model)
+    except Exception as exc:
+        return {"error": f"Could not compute dead-end metabolites: {exc}"}
+
+    dead_end_metabolites = []
+    for d in dead_end_raw:
+        met = model.metabolites.get_by_id(d["id"])
+        dead_end_metabolites.append({
+            "id": met.id,
+            "name": clean_metabolite_display_name(met),
+            "compartment": met.compartment,
+            "compartment_name": compartment_names.get(met.compartment, met.compartment),
+            "formula": getattr(met, "formula", None),
+            "reason": d["reason"],
+            "reactions": d["reactions"],
+        })
+
+    return {
+        "blocked_reactions": blocked_reactions,
+        "dead_end_metabolites": dead_end_metabolites,
+        "zero_cutoff": safe_float(zero_cutoff) if zero_cutoff is not None else safe_float(model.tolerance),
+        "note": (
+            f"{len(blocked_reactions)} blocked reaction(s) (cannot carry any flux under the model's current bounds) "
+            f"and {len(dead_end_metabolites)} dead-end metabolite(s) (can only ever be produced or only ever be "
+            "consumed given current reaction bounds/reversibility, or -- rarely -- have no reactions at all)."
+        ),
+    }
+
+# ---------------------------------------------------------------------------
+# Demand & Sink Audit (on-request, part of the Network Gaps tab).
+#
+# Demand and sink reactions (cobra's model.demands / model.sinks) are
+# single-metabolite boundary reactions used to model things like forced
+# accumulation, biomass side-components, or buffered cofactor pools --
+# they're often added by hand during model curation and can go stale
+# (left over from an earlier model version, or never actually load-bearing)
+# without anyone noticing, since they don't show up in the Exchange
+# essentiality tab (that's exchanges only). This mirrors the same
+# essentiality test used there (reaction knockout, KO growth < 5% of WT
+# growth), applied to demand/sink reactions instead, plus whether each one
+# even carries flux in the current FBA solution at all -- a demand/sink
+# with zero flux AND zero essentiality is a reasonable candidate for "is
+# this reaction still needed?"
+# ---------------------------------------------------------------------------
+
+def compute_demand_sink_audit(model):
+    """Audit every demand and sink reaction: metabolite, bounds/
+    reversibility, whether it carries flux in the current (fresh) FBA
+    solution, and a reaction-knockout essentiality test identical in
+    definition to the one used for exchanges. Uses plain slim_optimize()
+    per reaction (bounds temporarily zeroed and restored, exactly like
+    stream_ko_analysis above) rather than FVA, so it doesn't carry the
+    same repeated-solve numerical risk noted on find_blocked_reactions
+    above -- this is the same pattern already used for exchange
+    essentiality, which has not shown that failure mode.
+    """
+    wt_solution = model.optimize()
+    if wt_solution.status != "optimal":
+        return {"error": f"WT optimization was not optimal (status: {wt_solution.status})."}
+    wt_growth = max(0.0, safe_float(wt_solution.objective_value) or 0.0)
+    fluxes = wt_solution.fluxes
+
+    rows = []
+    for kind, reactions in (("demand", model.demands), ("sink", model.sinks)):
+        for rxn in reactions:
+            met = next(iter(rxn.metabolites.keys()), None)
+            wt_flux = safe_float(fluxes.get(rxn.id)) if hasattr(fluxes, "get") else None
+
+            ko_growth = None
+            ko_status = "not tested"
+            if wt_growth > 0:
+                old_lb, old_ub = rxn.lower_bound, rxn.upper_bound
+                try:
+                    rxn.lower_bound = 0
+                    rxn.upper_bound = 0
+                    value = model.slim_optimize(error_value=None)
+                    if value is None:
+                        ko_status = "infeasible"
+                    else:
+                        ko_status = "optimal"
+                        ko_growth = max(0.0, safe_float(value) or 0.0)
+                except Exception as exc:
+                    ko_status = f"error: {exc}"
+                finally:
+                    rxn.lower_bound = old_lb
+                    rxn.upper_bound = old_ub
+
+            ratio = None
+            essential = False
+            if ko_growth is not None and wt_growth > 0:
+                ratio = ko_growth / wt_growth
+                essential = ratio < 0.05
+
+            rows.append({
+                "id": rxn.id,
+                "name": rxn.name,
+                "kind": kind,
+                "metabolite_id": met.id if met else None,
+                "metabolite_name": clean_metabolite_display_name(met) if met else None,
+                "compartment": met.compartment if met else None,
+                "lower_bound": safe_float(rxn.lower_bound),
+                "upper_bound": safe_float(rxn.upper_bound),
+                "reversible": bool(rxn.lower_bound < 0 and rxn.upper_bound > 0),
+                "wt_flux": wt_flux,
+                "used_in_wt_solution": bool(wt_flux is not None and abs(wt_flux) > 1e-9),
+                "ko_growth": ko_growth,
+                "ko_growth_fraction": ratio,
+                "essential": essential,
+                "ko_status": ko_status,
+                "subsystem": subsystem_value(rxn),
+                "gene_reaction_rule": getattr(rxn, "gene_reaction_rule", ""),
+                "reaction_string": rxn.reaction,
+            })
+
+    rows.sort(key=lambda r: (r["kind"], r["id"]))
+    n_demand = sum(1 for r in rows if r["kind"] == "demand")
+    n_sink = sum(1 for r in rows if r["kind"] == "sink")
+    n_unused = sum(1 for r in rows if not r["used_in_wt_solution"])
+    n_essential = sum(1 for r in rows if r["essential"])
+
+    return {
+        "rows": rows,
+        "wt_growth": wt_growth,
+        "note": (
+            f"{n_demand} demand reaction(s), {n_sink} sink reaction(s). {n_unused} carry no flux in the current "
+            f"FBA solution; {n_essential} are essential (reaction knockout gives growth < 5% of WT growth)."
+        ),
+    }
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -1188,6 +1570,89 @@ def api_analyze():
                 "error": str(exc),
                 "hint": "For SBML, install python-libsbml. For MATLAB files, ensure the relevant COBRApy dependencies are installed."
             }), 500
+
+@app.post("/api/minimal-medium")
+def api_minimal_medium():
+    """On-request report for the Minimal Medium tab: the smallest nutrient
+    set sustaining a user-chosen fraction of the model's own maximum growth
+    rate. Independent of the diet chosen at upload time, and never changes
+    the cached model (see compute_minimal_medium_report)."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    model_id = data.get("model_id")
+    if not model_id or model_id not in MODEL_CACHE:
+        return jsonify({"error": "Model not found or expired. Please re-run the initial analysis."}), 404
+
+    try:
+        growth_cutoff_fraction = float(data.get("growth_cutoff_fraction", 1.0))
+    except (TypeError, ValueError):
+        growth_cutoff_fraction = 1.0
+
+    touch_model_cache(model_id)
+    model, _ = MODEL_CACHE[model_id]
+
+    try:
+        report = compute_minimal_medium_report(model, growth_cutoff_fraction)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    if "error" in report:
+        return jsonify({"status": "error", **report}), 400
+    return jsonify({"status": "success", **report})
+
+@app.post("/api/network-gaps")
+def api_network_gaps():
+    """On-request report for the Network Gaps tab: reactions that can't
+    carry any flux under the model's current bounds, plus structurally
+    dead-end metabolites. Independent of every other tab; never changes
+    the cached model (see compute_network_gaps_report)."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    model_id = data.get("model_id")
+    if not model_id or model_id not in MODEL_CACHE:
+        return jsonify({"error": "Model not found or expired. Please re-run the initial analysis."}), 404
+
+    touch_model_cache(model_id)
+    model, _ = MODEL_CACHE[model_id]
+
+    try:
+        report = compute_network_gaps_report(model)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    if "error" in report:
+        return jsonify({"status": "error", **report}), 400
+    return jsonify({"status": "success", **report})
+
+@app.post("/api/demand-sink-audit")
+def api_demand_sink_audit():
+    """On-request report for the Demand & Sink Audit section: every demand
+    and sink reaction's metabolite, bounds, WT usage, and knockout
+    essentiality. Independent of every other tab; never permanently changes
+    the cached model (see compute_demand_sink_audit)."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    model_id = data.get("model_id")
+    if not model_id or model_id not in MODEL_CACHE:
+        return jsonify({"error": "Model not found or expired. Please re-run the initial analysis."}), 404
+
+    touch_model_cache(model_id)
+    model, _ = MODEL_CACHE[model_id]
+
+    try:
+        report = compute_demand_sink_audit(model)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    if "error" in report:
+        return jsonify({"status": "error", **report}), 400
+    return jsonify({"status": "success", **report})
 
 @app.post("/api/debug-exchanges")
 def api_debug_exchanges():
@@ -1466,8 +1931,14 @@ def api_trace_pathway():
                         "after_ko": after,
                     }
                 else:
-                    wt_growth = before["growth"] or 0.0
-                    ko_growth = after.get("growth") or 0.0
+                    # Clamp near-zero floating-point solver noise (a lethal
+                    # knockout can solve to e.g. -1e-15 instead of exactly 0)
+                    # up to 0, matching how stream_ko_analysis and
+                    # debug_exchange_to_biomass's caller already treat KO
+                    # growth elsewhere in this file. Without this, a fully
+                    # lethal knockout could display as "-0%" retained.
+                    wt_growth = max(0.0, safe_float(before["growth"]) or 0.0)
+                    ko_growth = max(0.0, safe_float(after.get("growth")) or 0.0)
                     response["knockout"] = {
                         "targets": resolved_targets,
                         "not_found": not_found,
@@ -1484,4 +1955,6 @@ def api_trace_pathway():
     return jsonify(response)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(
+        host="127.0.0.1", 
+        port=5000, debug=True)

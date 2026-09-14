@@ -104,6 +104,9 @@ analyzeBtn.addEventListener("click", async () => {
     TRACER_KO_VIEW = "before";
     TRACER_HIGHLIGHT_KO = true;
     if (TRACER_CY) { TRACER_CY.destroy(); TRACER_CY = null; }
+    MINMED_RESULT = null;
+    NETGAPS_RESULT = null;
+    DSAUDIT_RESULT = null;
 
     // Show initial results
     renderAll();
@@ -119,20 +122,39 @@ analyzeBtn.addEventListener("click", async () => {
   }
 });
 
+// Kept at module scope so a new analysis run can always find and close
+// whatever stream a *previous* run left open (see streamKOAnalysis).
+let CURRENT_KO_EVENTSOURCE = null;
+
 function streamKOAnalysis(modelId) {
+  // Bug fix: re-uploading a model while a previous model's KO-essentiality
+  // stream was still running left that old EventSource open with no
+  // reference anywhere. Its "complete" handler would still fire later and
+  // overwrite DATA.exchanges/essentiality_rule/transport_rule -- which by
+  // then belong to the *new* model -- with the stale model's results.
+  // Closing any previous stream before opening this one, plus the modelId
+  // guard in the handlers below (belt-and-braces against a message that was
+  // already in flight the instant close() was called), eliminates the race.
+  if (CURRENT_KO_EVENTSOURCE) {
+    CURRENT_KO_EVENTSOURCE.close();
+    CURRENT_KO_EVENTSOURCE = null;
+  }
+
   const eventSource = new EventSource(`/api/analyze-ko/${modelId}`);
+  CURRENT_KO_EVENTSOURCE = eventSource;
   let receivedAny = false;
-  
+
   eventSource.onopen = () => {
     console.log("Connection opened for model:", modelId);
   };
-  
+
   eventSource.onmessage = (event) => {
+    if (modelId !== MODEL_ID) { eventSource.close(); return; } // superseded by a newer analysis
     try {
       receivedAny = true;
       const msg = JSON.parse(event.data);
       console.log("Received message:", msg.type);
-      
+
       if (msg.type === "info") {
         status.textContent = msg.message;
       } else if (msg.type === "progress") {
@@ -142,19 +164,21 @@ function streamKOAnalysis(modelId) {
         DATA.exchanges = msg.exchanges;
         DATA.essentiality_rule = msg.essentiality_rule;
         DATA.transport_rule = msg.transport_rule;
-        
+
         // Re-render with completed data
         renderExchanges();
         status.textContent = "Analysis complete!";
         analyzeBtn.disabled = false;
         eventSource.close();
+        if (CURRENT_KO_EVENTSOURCE === eventSource) CURRENT_KO_EVENTSOURCE = null;
       }
     } catch (err) {
       console.error("Parse error:", err, "Raw data:", event.data);
     }
   };
-  
+
   eventSource.onerror = (err) => {
+    if (modelId !== MODEL_ID) { eventSource.close(); return; } // superseded by a newer analysis
     console.error("EventSource error:", err, "Received any data:", receivedAny);
     if (receivedAny) {
       // If we received data but got an error, it might just be connection closing normally
@@ -164,6 +188,7 @@ function streamKOAnalysis(modelId) {
       status.innerHTML = `<span class="error">Connection error - try uploading again</span>`;
     }
     eventSource.close();
+    if (CURRENT_KO_EVENTSOURCE === eventSource) CURRENT_KO_EVENTSOURCE = null;
     analyzeBtn.disabled = false;
   };
 }
@@ -202,6 +227,37 @@ function fmt(x, digits=4) {
   return n.toFixed(digits).replace(/\.?0+$/, "");
 }
 function join(x) { return (x || []).join(", "); }
+
+// ---------------------------------------------------------------------------
+// Generic "export this table to CSV" helper, shared by the Minimal Medium
+// and Network Gaps tabs (and reusable by any future one). `columns` is a
+// list of {key, label} -- or {value: row => ..., label} for a computed
+// column -- and `rows` is the array of row objects currently on screen
+// (whatever the table is showing right now, respecting any sort already
+// applied). Runs entirely client-side: no server round-trip, just a Blob
+// download via a throwaway <a download> link.
+// ---------------------------------------------------------------------------
+function csvCell(value) {
+  if (value === null || value === undefined) return "";
+  const s = String(value);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+function exportTableToCsv(filename, columns, rows) {
+  const header = columns.map(c => csvCell(c.label)).join(",");
+  const lines = (rows || []).map(row =>
+    columns.map(c => csvCell(typeof c.value === "function" ? c.value(row) : row[c.key])).join(",")
+  );
+  const csv = [header, ...lines].join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 // Make table sortable by adding click handlers to headers
 function makeSortable(tableId, rows, renderFn) {
@@ -257,6 +313,8 @@ function renderAll() {
   renderMetabolites();
   renderExchanges();
   renderObjective();
+  renderMinimalMedium();
+  renderNetworkGaps();
   renderTracer();
 }
 
@@ -606,6 +664,395 @@ function compartmentBadges(compartmentIds) {
   return ids.map(id =>
     `<span class="badge" title="${escapeHtml(COMP_NAMES[id] || id)}">${escapeHtml(id)}</span>`
   ).join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// Minimal Medium tab (on-request, as soon as the model loads).
+//
+// Separate from the "Diet / media" choice made before clicking "Analyze
+// model" (which, for mode "minimal", permanently constrains the analyzed
+// model to a computed minimal medium at 100% of its own max growth). This
+// tab instead reports -- non-destructively, repeatable for any growth
+// cutoff -- what the minimal nutrient set looks like, without touching the
+// model that's actually being analyzed elsewhere in the app.
+// ---------------------------------------------------------------------------
+
+let MINMED_RESULT = null;
+
+function renderMinimalMedium() {
+  $("minmed").innerHTML = `
+    <div class="note">
+      Compute the smallest set of nutrients (exchange reactions) that sustains a chosen fraction of the model's
+      own maximum growth rate, via <code>cobra.medium.minimal_medium</code>. This is a separate, on-request
+      calculation from the "Diet / media" choice made before analysis — it never changes the analyzed model, and
+      you can recompute it for a different growth cutoff at any time.
+    </div>
+    <div class="toolbar">
+      <label for="minmedCutoff">Growth cutoff (fraction of WT growth, 0–1)</label>
+      <input id="minmedCutoff" type="number" min="0.01" max="1" step="0.01" value="1.0" style="width:5.5em;">
+      <button id="minmedRunBtn" type="button">Compute minimal medium</button>
+      <span id="minmedCount"></span>
+    </div>
+    <div id="minmedStatus" class="debug-status"></div>
+    <div id="minmedResults"></div>
+  `;
+  $("minmedRunBtn").addEventListener("click", runMinimalMedium);
+}
+
+async function runMinimalMedium() {
+  const cutoffInput = $("minmedCutoff");
+  let cutoff = parseFloat(cutoffInput.value);
+  if (!Number.isFinite(cutoff) || cutoff <= 0) cutoff = 1.0;
+  cutoff = Math.max(0.01, Math.min(1, cutoff));
+  cutoffInput.value = cutoff;
+
+  if (!MODEL_ID) {
+    $("minmedStatus").innerHTML = `<span class="error">Model session expired — please re-run the initial analysis.</span>`;
+    return;
+  }
+
+  const btn = $("minmedRunBtn");
+  btn.disabled = true;
+  $("minmedStatus").textContent = `Computing minimal medium at ${(cutoff * 100).toFixed(0)}% of WT growth…`;
+  $("minmedResults").innerHTML = "";
+  $("minmedCount").textContent = "";
+
+  try {
+    const res = await fetch("/api/minimal-medium", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: MODEL_ID, growth_cutoff_fraction: cutoff }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || "Minimal medium computation failed");
+
+    MINMED_RESULT = data;
+    $("minmedStatus").textContent = data.note || "";
+    renderMinimalMediumTable(data.components || []);
+    setTimeout(() => makeSortable("minmedTable", data.components || [], renderMinimalMediumTable), 0);
+  } catch (err) {
+    MINMED_RESULT = null;
+    $("minmedStatus").innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
+    $("minmedResults").innerHTML = "";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+const MINMED_CSV_COLUMNS = [
+  { key: "exchange_name", label: "Exchange reaction name" },
+  { key: "exchange_id", label: "Exchange reaction ID" },
+  { key: "metabolite_id", label: "Metabolite ID" },
+  { key: "metabolite_name", label: "Metabolite name" },
+  { key: "uptake_flux", label: "Flux" },
+];
+
+function renderMinimalMediumTable(components) {
+  $("minmedCount").textContent = `${components.length} component(s)`;
+  if (!components.length) {
+    $("minmedResults").innerHTML = `<div class="note">No components returned.</div>`;
+    return;
+  }
+  $("minmedResults").innerHTML = `
+    <div class="toolbar"><button id="minmedExportBtn" type="button">Export table to CSV</button></div>
+    <div class="table-wrap"><table id="minmedTable">
+      <thead><tr>
+        <th data-key="exchange_name">Exchange reaction name</th>
+        <th data-key="exchange_id">Exchange reaction ID</th>
+        <th data-key="metabolite_id">Metabolite ID</th>
+        <th data-key="metabolite_name">Metabolite name</th>
+        <th data-key="uptake_flux">Flux</th>
+      </tr></thead>
+      <tbody>${components.map(c => `<tr>
+        <td class="wrap">${escapeHtml(c.exchange_name || "—")}</td>
+        <td><strong>${escapeHtml(c.exchange_id)}</strong></td>
+        <td>${escapeHtml(c.metabolite_id || "—")}</td>
+        <td>${escapeHtml(c.metabolite_name || "—")}</td>
+        <td class="num">${fmt(c.uptake_flux, 4)}</td>
+      </tr>`).join("")}</tbody>
+    </table></div>
+  `;
+  $("minmedExportBtn").addEventListener("click", () =>
+    exportTableToCsv("minimal_medium.csv", MINMED_CSV_COLUMNS, components)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Network Gaps tab (on-request, as soon as the model loads).
+//
+// Two complementary diagnostics under the model's current bounds (whatever
+// diet was applied at upload): reactions that can't carry any flux at all
+// ("blocked"), and metabolites that structurally can only ever be produced
+// or only ever be consumed ("dead ends") -- often *why* a reaction ends up
+// blocked, though not the only possible reason, which is why both are shown
+// together. Both tables export to CSV independently.
+// ---------------------------------------------------------------------------
+
+let NETGAPS_RESULT = null;
+
+const NETGAPS_BLOCKED_CSV_COLUMNS = [
+  { key: "id", label: "Reaction ID" },
+  { key: "name", label: "Reaction name" },
+  { key: "subsystem", label: "Subsystem" },
+  { key: "type", label: "Type" },
+  { key: "lower_bound", label: "LB" },
+  { key: "upper_bound", label: "UB" },
+  { key: "gene_reaction_rule", label: "GPR" },
+  { key: "reaction_string", label: "Reaction" },
+];
+const NETGAPS_DEADEND_CSV_COLUMNS = [
+  { key: "id", label: "Metabolite ID" },
+  { key: "name", label: "Metabolite name" },
+  { key: "compartment", label: "Compartment" },
+  { key: "reason", label: "Reason" },
+  { value: r => join(r.reactions), label: "Reactions involved" },
+];
+
+const NETGAPS_REASON_LABELS = {
+  no_consuming_reaction: "Never consumed (only ever produced)",
+  no_producing_reaction: "Never produced (only ever consumed)",
+  fully_blocked: "Fully blocked (bounds allow neither direction)",
+  no_reactions: "No reactions at all",
+};
+
+function renderNetworkGaps() {
+  $("gaps").innerHTML = `
+    <h2>Blocked reactions &amp; dead-end metabolites</h2>
+    <div class="note">
+      Two structural diagnostics under the model's current bounds (whatever diet was applied): reactions that
+      can't carry any flux at all (via COBRApy's flux-variability-based <code>find_blocked_reactions</code>), and
+      metabolites that can only ever be produced or only ever be consumed given their reactions' current
+      bounds/reversibility ("dead ends") — often the reason a reaction ends up blocked. Neither ever changes the
+      analyzed model. Blocked-reaction detection can take a while for large models (it runs flux variability
+      analysis on every reaction that carries no flux in the current solution).
+    </div>
+    <div class="toolbar">
+      <button id="gapsRunBtn" type="button">Compute network gaps</button>
+      <span id="gapsCount"></span>
+    </div>
+    <div id="gapsStatus" class="debug-status"></div>
+    <div id="gapsResults"></div>
+
+    <h2>Demand &amp; sink audit</h2>
+    <div class="note">
+      Every demand and sink reaction (single-metabolite boundary reactions used for things like forced
+      accumulation or buffered cofactor pools — distinct from exchanges, so they don't appear in the Exchange
+      essentiality tab), with its bounds, whether it carries flux in the current FBA solution, and the same
+      reaction-knockout essentiality test used for exchanges. A demand/sink that's unused AND non-essential is a
+      reasonable candidate for "does the model still need this?" — and one that's unused but silently essential
+      (like an over-permissive sink papering over a thermodynamically unrealistic loop) is worth a closer look.
+    </div>
+    <div class="toolbar">
+      <button id="dsAuditRunBtn" type="button">Run demand &amp; sink audit</button>
+      <span id="dsAuditCount"></span>
+    </div>
+    <div id="dsAuditStatus" class="debug-status"></div>
+    <div id="dsAuditResults"></div>
+  `;
+  $("gapsRunBtn").addEventListener("click", runNetworkGaps);
+  $("dsAuditRunBtn").addEventListener("click", runDemandSinkAudit);
+}
+
+async function runNetworkGaps() {
+  if (!MODEL_ID) {
+    $("gapsStatus").innerHTML = `<span class="error">Model session expired — please re-run the initial analysis.</span>`;
+    return;
+  }
+
+  const btn = $("gapsRunBtn");
+  btn.disabled = true;
+  $("gapsStatus").textContent = "Computing blocked reactions and dead-end metabolites…";
+  $("gapsResults").innerHTML = "";
+  $("gapsCount").textContent = "";
+
+  try {
+    const res = await fetch("/api/network-gaps", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: MODEL_ID }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || "Network gaps computation failed");
+
+    NETGAPS_RESULT = data;
+    $("gapsStatus").textContent = data.note || "";
+    $("gapsCount").textContent =
+      `${data.blocked_reactions.length} blocked reaction(s) · ${data.dead_end_metabolites.length} dead-end metabolite(s)`;
+    renderNetworkGapsResults(data);
+  } catch (err) {
+    NETGAPS_RESULT = null;
+    $("gapsStatus").innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
+    $("gapsResults").innerHTML = "";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderNetworkGapsResults(data) {
+  $("gapsResults").innerHTML = `
+    <h3>Blocked reactions</h3>
+    <div id="gapsBlockedWrap"></div>
+    <h3>Dead-end metabolites</h3>
+    <div id="gapsDeadendWrap"></div>
+  `;
+  renderBlockedReactionsTable(data.blocked_reactions || []);
+  setTimeout(() => makeSortable("gapsBlockedTable", data.blocked_reactions || [], renderBlockedReactionsTable), 0);
+  renderDeadEndTable(data.dead_end_metabolites || []);
+  setTimeout(() => makeSortable("gapsDeadendTable", data.dead_end_metabolites || [], renderDeadEndTable), 0);
+}
+
+function renderBlockedReactionsTable(rows) {
+  const wrap = $("gapsBlockedWrap");
+  if (!rows.length) {
+    wrap.innerHTML = `<div class="note">No blocked reactions found under the model's current bounds.</div>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="toolbar"><button id="gapsBlockedExportBtn" type="button">Export table to CSV</button></div>
+    <div class="table-wrap"><table id="gapsBlockedTable">
+      <thead><tr>
+        <th data-key="id">ID</th>
+        <th data-key="name">Name</th>
+        <th data-key="subsystem">Subsystem</th>
+        <th data-key="type">Type</th>
+        <th data-key="lower_bound">LB</th>
+        <th data-key="upper_bound">UB</th>
+        <th data-key="gene_reaction_rule">GPR</th>
+      </tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td><strong>${escapeHtml(r.id)}</strong></td>
+        <td class="wrap">${escapeHtml(r.name || "—")}</td>
+        <td>${escapeHtml(r.subsystem || "—")}</td>
+        <td><span class="badge">${escapeHtml(r.type)}</span></td>
+        <td class="num">${fmt(r.lower_bound, 2)}</td>
+        <td class="num">${fmt(r.upper_bound, 2)}</td>
+        <td class="wrap">${escapeHtml(r.gene_reaction_rule || "—")}</td>
+      </tr>`).join("")}</tbody>
+    </table></div>
+  `;
+  $("gapsBlockedExportBtn").addEventListener("click", () =>
+    exportTableToCsv("blocked_reactions.csv", NETGAPS_BLOCKED_CSV_COLUMNS, rows)
+  );
+}
+
+function renderDeadEndTable(rows) {
+  const wrap = $("gapsDeadendWrap");
+  if (!rows.length) {
+    wrap.innerHTML = `<div class="note">No dead-end metabolites found.</div>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="toolbar"><button id="gapsDeadendExportBtn" type="button">Export table to CSV</button></div>
+    <div class="table-wrap"><table id="gapsDeadendTable">
+      <thead><tr>
+        <th data-key="id">Metabolite ID</th>
+        <th data-key="name">Metabolite name</th>
+        <th data-key="compartment">Compartment</th>
+        <th data-key="reason">Reason</th>
+        <th>Reactions involved</th>
+      </tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td><strong>${escapeHtml(r.id)}</strong></td>
+        <td>${escapeHtml(r.name || "—")}</td>
+        <td>${compartmentBadges([r.compartment])}</td>
+        <td>${escapeHtml(NETGAPS_REASON_LABELS[r.reason] || r.reason)}</td>
+        <td class="wrap">${escapeHtml(join(r.reactions))}</td>
+      </tr>`).join("")}</tbody>
+    </table></div>
+  `;
+  $("gapsDeadendExportBtn").addEventListener("click", () =>
+    exportTableToCsv("dead_end_metabolites.csv", NETGAPS_DEADEND_CSV_COLUMNS, rows)
+  );
+}
+
+let DSAUDIT_RESULT = null;
+
+const DSAUDIT_CSV_COLUMNS = [
+  { key: "id", label: "Reaction ID" },
+  { key: "name", label: "Reaction name" },
+  { key: "kind", label: "Kind (demand/sink)" },
+  { key: "metabolite_id", label: "Metabolite ID" },
+  { key: "metabolite_name", label: "Metabolite name" },
+  { key: "compartment", label: "Compartment" },
+  { key: "lower_bound", label: "LB" },
+  { key: "upper_bound", label: "UB" },
+  { key: "wt_flux", label: "WT flux" },
+  { value: r => (r.used_in_wt_solution ? "Yes" : "No"), label: "Used in WT solution?" },
+  { key: "ko_growth", label: "KO growth" },
+  { value: r => (r.ko_growth_fraction == null ? "" : r.ko_growth_fraction), label: "KO growth fraction" },
+  { value: r => (r.essential ? "Yes" : "No"), label: "Essential?" },
+];
+
+async function runDemandSinkAudit() {
+  if (!MODEL_ID) {
+    $("dsAuditStatus").innerHTML = `<span class="error">Model session expired — please re-run the initial analysis.</span>`;
+    return;
+  }
+
+  const btn = $("dsAuditRunBtn");
+  btn.disabled = true;
+  $("dsAuditStatus").textContent = "Auditing demand and sink reactions…";
+  $("dsAuditResults").innerHTML = "";
+  $("dsAuditCount").textContent = "";
+
+  try {
+    const res = await fetch("/api/demand-sink-audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: MODEL_ID }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || "Demand & sink audit failed");
+
+    DSAUDIT_RESULT = data;
+    $("dsAuditStatus").textContent = data.note || "";
+    $("dsAuditCount").textContent = `${data.rows.length} reaction(s)`;
+    renderDemandSinkAuditTable(data.rows || []);
+    setTimeout(() => makeSortable("dsAuditTable", data.rows || [], renderDemandSinkAuditTable), 0);
+  } catch (err) {
+    DSAUDIT_RESULT = null;
+    $("dsAuditStatus").innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
+    $("dsAuditResults").innerHTML = "";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderDemandSinkAuditTable(rows) {
+  if (!rows.length) {
+    $("dsAuditResults").innerHTML = `<div class="note">No demand or sink reactions found in this model.</div>`;
+    return;
+  }
+  $("dsAuditResults").innerHTML = `
+    <div class="toolbar"><button id="dsAuditExportBtn" type="button">Export table to CSV</button></div>
+    <div class="table-wrap"><table id="dsAuditTable">
+      <thead><tr>
+        <th data-key="kind">Kind</th>
+        <th data-key="id">ID</th>
+        <th data-key="name">Name</th>
+        <th data-key="metabolite_id">Metabolite</th>
+        <th data-key="lower_bound">LB</th>
+        <th data-key="upper_bound">UB</th>
+        <th data-key="wt_flux">WT flux</th>
+        <th data-key="ko_growth_fraction">Growth retained after KO</th>
+        <th data-key="essential">Essential?</th>
+      </tr></thead>
+      <tbody>${rows.map(r => `<tr class="${r.essential ? "row-essential" : ""}">
+        <td><span class="badge">${escapeHtml(r.kind)}</span></td>
+        <td><strong>${escapeHtml(r.id)}</strong></td>
+        <td class="wrap">${escapeHtml(r.name || "—")}</td>
+        <td>${escapeHtml(r.metabolite_name || r.metabolite_id || "—")} <span class="stoich">${escapeHtml(r.metabolite_id || "")}</span></td>
+        <td class="num">${fmt(r.lower_bound, 2)}</td>
+        <td class="num">${fmt(r.upper_bound, 2)}</td>
+        <td class="num">${fmt(r.wt_flux)}${r.used_in_wt_solution ? "" : ` <span class="stoich">(unused)</span>`}</td>
+        <td>${growthBar(r.ko_growth_fraction)}</td>
+        <td><span class="badge ${r.essential ? "bad" : "good"}">${r.essential ? "ESSENTIAL" : "No"}</span></td>
+      </tr>`).join("")}</tbody>
+    </table></div>
+  `;
+  $("dsAuditExportBtn").addEventListener("click", () =>
+    exportTableToCsv("demand_sink_audit.csv", DSAUDIT_CSV_COLUMNS, rows)
+  );
 }
 
 // ---------------------------------------------------------------------------
