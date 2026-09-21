@@ -16,6 +16,11 @@ const dietMode = $("dietMode");
 const dietDropzone = $("dietDropzone");
 const dietFileInput = $("dietFile");
 const dietFilenameEl = $("dietFilename");
+const reportBtn = $("reportBtn");
+reportBtn.addEventListener("click", () => {
+  if (!DATA) return;
+  renderReportModal();
+});
 
 fileInput.addEventListener("change", () => {
   const file = fileInput.files[0];
@@ -107,6 +112,9 @@ analyzeBtn.addEventListener("click", async () => {
     MINMED_RESULT = null;
     NETGAPS_RESULT = null;
     DSAUDIT_RESULT = null;
+    FROG_RESULT = null;
+    if (CURRENT_FROG_EVENTSOURCE) { CURRENT_FROG_EVENTSOURCE.close(); CURRENT_FROG_EVENTSOURCE = null; }
+    closeReportModal();
 
     // Show initial results
     renderAll();
@@ -316,6 +324,7 @@ function renderAll() {
   renderMinimalMedium();
   renderNetworkGaps();
   renderTracer();
+  renderFrog();
 }
 
 function renderSummary() {
@@ -1735,4 +1744,744 @@ function attachTracerNetworkTooltips(cy) {
   // all, so the tooltip needs its own listener on the container itself.
   const container = cy.container();
   if (container) container.addEventListener("mouseleave", () => hideTooltip());
+}
+
+// ---------------------------------------------------------------------------
+// Shared "save this generated HTML report" helpers -- used by both the FROG
+// tab's own "save as HTML" button and the multi-section Generate Report
+// modal below. Saving to an arbitrary path only works because this Flask
+// server and the browser are expected to be on the same machine (the local-
+// desktop-use pattern this whole app assumes): /api/browse-save-path opens a
+// native "Save As" dialog in a short-lived helper process on that same
+// machine, and /api/save-report then writes the given HTML straight to the
+// chosen path. When no path is given (or Browse isn't available here -- no
+// tkinter, no display, or this is actually a remote deployment), the report
+// is instead downloaded straight through the browser, the same client-side
+// Blob mechanism already used for CSV export.
+// ---------------------------------------------------------------------------
+
+function reportDocumentHtml(title, bodyHtml) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; background:#f5f7fb; color:#18212f; }
+  .report-wrap { max-width:1100px; margin:0 auto; padding:28px 24px 60px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:18px; margin:32px 0 8px; padding-top:16px; border-top:1px solid #e5eaf1; }
+  h2:first-of-type { border-top:0; padding-top:0; }
+  h3 { font-size:14px; margin:18px 0 6px; color:#334155; }
+  .report-meta { color:#64748b; font-size:13px; margin-bottom:20px; }
+  .report-note { padding:10px 12px; background:#fffbeb; border:1px solid #fde68a; border-radius:9px; color:#854d0e; margin-bottom:14px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; margin-bottom:8px; }
+  th, td { padding:7px 9px; border-bottom:1px solid #e5eaf1; text-align:left; vertical-align:top; }
+  th { background:#f8fafc; position:sticky; top:0; }
+  .table-scroll { max-height:560px; overflow:auto; border:1px solid #e5eaf1; border-radius:8px; margin-bottom:16px; }
+  .toc { margin:0 0 24px; padding:14px 18px; background:#fff; border:1px solid #e5eaf1; border-radius:10px; }
+  .toc ul { margin:6px 0 0; padding-left:20px; }
+  .toc a { color:#2563eb; text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="report-wrap">
+${bodyHtml}
+</div>
+</body>
+</html>`;
+}
+
+// Plain (non-interactive) table markup for embedding in a generated report
+// -- distinct from the live, sortable/filterable DOM tables elsewhere in
+// this file. Numbers are run through fmt() for readability; everything else
+// is shown as-is (escaped). `columns` uses the same {key,label} / {value:
+// row => ..., label} shape as exportTableToCsv's columns.
+function staticTableHtml(columns, rows, opts) {
+  opts = opts || {};
+  if (!rows || !rows.length) return `<div class="report-note">${escapeHtml(opts.emptyMessage || "No rows.")}</div>`;
+  const head = columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("");
+  const body = rows.map(row => `<tr>${columns.map(c => {
+    const raw = typeof c.value === "function" ? c.value(row) : row[c.key];
+    let cell;
+    if (raw === null || raw === undefined) cell = "—";
+    else if (typeof raw === "number") cell = fmt(raw, opts.digits || 6);
+    else cell = String(raw);
+    return `<td>${escapeHtml(cell)}</td>`;
+  }).join("")}</tr>`).join("");
+  return `<div class="table-scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+async function pickSavePath(defaultName) {
+  try {
+    const res = await fetch(`/api/browse-save-path?default_name=${encodeURIComponent(defaultName)}`);
+    return await res.json(); // { path } or { path: null, error }
+  } catch (err) {
+    return { path: null, error: err.message };
+  }
+}
+
+function downloadHtmlFile(filename, html) {
+  const blob = new Blob([html], { type: "text/html;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Writes `html` to `path` on this machine via /api/save-report when a path
+// was given, otherwise downloads it straight through the browser. Returns
+// {ok, message} rather than throwing, so callers can show the outcome
+// inline without their own try/catch.
+async function saveGeneratedHtml(html, path, defaultFilename) {
+  if (path && path.trim()) {
+    try {
+      const res = await fetch("/api/save-report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: path.trim(), html }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || "Could not save the report.");
+      return { ok: true, message: `Saved to ${data.path}` };
+    } catch (err) {
+      return { ok: false, message: err.message };
+    }
+  }
+  downloadHtmlFile(defaultFilename, html);
+  return { ok: true, message: `Downloaded as ${defaultFilename}.` };
+}
+
+// Renders a "Save to [___] [Browse…]" row into `container` and wires the
+// Browse button to /api/browse-save-path. Returns a getter for whatever
+// path is currently in the text field (possibly empty, meaning "download
+// instead"). idPrefix must be unique per container on the page.
+function attachSavePathPicker(container, idPrefix, defaultName) {
+  container.innerHTML = `
+    <div class="report-savepath-row">
+      <label style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;">Save to</label>
+      <input id="${idPrefix}Input" type="text" placeholder="Leave blank to download via your browser instead">
+      <button type="button" id="${idPrefix}BrowseBtn">Browse…</button>
+    </div>
+    <div class="report-savepath-note" id="${idPrefix}Note">
+      "Browse…" opens a native Save-As dialog on this computer (works when this app is running on your own machine).
+      You can also type a full path directly, or leave it blank to download through your browser instead.
+    </div>
+  `;
+  const input = container.querySelector(`#${idPrefix}Input`);
+  const browseBtn = container.querySelector(`#${idPrefix}BrowseBtn`);
+  const note = container.querySelector(`#${idPrefix}Note`);
+  const defaultNoteHtml = note.innerHTML;
+
+  browseBtn.addEventListener("click", async () => {
+    browseBtn.disabled = true;
+    note.textContent = "Opening Save As dialog…";
+    const result = await pickSavePath(defaultName);
+    browseBtn.disabled = false;
+    if (result.path) {
+      input.value = result.path;
+      note.textContent = "Path chosen — click Generate/Save to write the report there.";
+    } else if (result.error) {
+      note.innerHTML = `<span class="error">${escapeHtml(result.error)}</span> — type a path manually, or leave blank to download instead.`;
+    } else {
+      note.innerHTML = defaultNoteHtml; // user cancelled the dialog
+    }
+  });
+
+  return () => input.value;
+}
+
+function sanitizeForFilename(name) {
+  return String(name || "model").replace(/[^a-z0-9_.-]+/gi, "_");
+}
+
+// ---------------------------------------------------------------------------
+// FROG Report tab (on-request) -- the reproducibility-check standard used
+// across the SBML/COMBINE community for genome-scale metabolic models:
+// Flux variability analysis, Reaction deletions, Objective value, Gene
+// deletions, all run against the model's current bounds (whatever diet was
+// applied at upload). F, R, and G can each be skipped independently -- R and
+// G are one LP solve per reaction/gene, so they're the slow part for a large
+// genome-scale model -- and FVA's growth cutoff is configurable, same idea
+// as the Minimal Medium tab's cutoff.
+// ---------------------------------------------------------------------------
+
+let FROG_RESULT = null;
+let CURRENT_FROG_EVENTSOURCE = null;
+
+const FROG_FVA_CSV_COLUMNS = [
+  { key: "id", label: "Reaction ID" },
+  { key: "minimum", label: "Minimum flux" },
+  { key: "maximum", label: "Maximum flux" },
+];
+const FROG_REACTION_DELETION_CSV_COLUMNS = [
+  { key: "id", label: "Reaction ID" },
+  { key: "growth", label: "Growth after knockout" },
+  { key: "status", label: "Solver status" },
+];
+const FROG_GENE_DELETION_CSV_COLUMNS = [
+  { key: "id", label: "Gene ID" },
+  { key: "growth", label: "Growth after knockout" },
+  { key: "status", label: "Solver status" },
+];
+
+function frogDefaultFilename() {
+  const name = DATA && DATA.stats && (DATA.stats.model_id || DATA.stats.model_name);
+  return `${sanitizeForFilename(name)}_frog_report.html`;
+}
+
+function renderFrog() {
+  $("frog").innerHTML = `
+    <div class="note">
+      <strong>FROG</strong> is a model-reproducibility check standard used in the SBML/COMBINE community:
+      <strong>F</strong>lux variability analysis, <strong>R</strong>eaction deletions, <strong>O</strong>bjective
+      value, <strong>G</strong>ene deletions — all computed against this model's current bounds (whatever diet was
+      applied at upload), so this model + medium can be cross-checked against any other FBA tool's results for the
+      same inputs. R and G are one LP solve per reaction/gene, so they can take a while on a large genome-scale
+      model — uncheck either to skip it.
+    </div>
+    <div class="frog-config">
+      <label>FVA growth cutoff (fraction of optimum)
+        <input id="frogFvaFraction" type="number" min="0" max="1" step="0.01" value="1.0">
+      </label>
+      <label><input id="frogIncludeFva" type="checkbox" checked> Include flux variability analysis (F)</label>
+      <label><input id="frogIncludeRxnDel" type="checkbox" checked> Include reaction deletions (R)</label>
+      <label><input id="frogIncludeGeneDel" type="checkbox" checked> Include gene deletions (G)</label>
+      <button id="frogRunBtn" type="button">Run FROG report</button>
+    </div>
+    <div id="frogStatus" class="debug-status"></div>
+    <div id="frogResults"></div>
+  `;
+  $("frogRunBtn").addEventListener("click", runFrogReport);
+}
+
+function runFrogReport() {
+  if (!MODEL_ID) {
+    $("frogStatus").innerHTML = `<span class="error">Model session expired — please re-run the initial analysis.</span>`;
+    return;
+  }
+  if (CURRENT_FROG_EVENTSOURCE) {
+    CURRENT_FROG_EVENTSOURCE.close();
+    CURRENT_FROG_EVENTSOURCE = null;
+  }
+
+  let fvaFraction = parseFloat($("frogFvaFraction").value);
+  if (!Number.isFinite(fvaFraction)) fvaFraction = 1.0;
+  fvaFraction = Math.max(0, Math.min(1, fvaFraction));
+  $("frogFvaFraction").value = fvaFraction;
+
+  const includeFva = $("frogIncludeFva").checked;
+  const includeRxnDel = $("frogIncludeRxnDel").checked;
+  const includeGeneDel = $("frogIncludeGeneDel").checked;
+
+  const btn = $("frogRunBtn");
+  btn.disabled = true;
+  $("frogStatus").textContent = "Starting FROG report…";
+  $("frogResults").innerHTML = "";
+  FROG_RESULT = null;
+
+  const modelId = MODEL_ID;
+  const params = new URLSearchParams({
+    fva_fraction: String(fvaFraction),
+    include_fva: includeFva ? "1" : "0",
+    include_reaction_deletions: includeRxnDel ? "1" : "0",
+    include_gene_deletions: includeGeneDel ? "1" : "0",
+  });
+  const eventSource = new EventSource(`/api/frog-report/${modelId}?${params.toString()}`);
+  CURRENT_FROG_EVENTSOURCE = eventSource;
+
+  eventSource.onmessage = (event) => {
+    if (modelId !== MODEL_ID) { eventSource.close(); return; } // superseded by a newer analysis
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (err) { return; }
+
+    if (msg.type === "info") {
+      $("frogStatus").textContent = msg.message;
+    } else if (msg.type === "error") {
+      $("frogStatus").innerHTML = `<span class="error">${escapeHtml(msg.message)}</span>`;
+      btn.disabled = false;
+      eventSource.close();
+      if (CURRENT_FROG_EVENTSOURCE === eventSource) CURRENT_FROG_EVENTSOURCE = null;
+    } else if (msg.type === "complete") {
+      FROG_RESULT = msg;
+      $("frogStatus").textContent = msg.note || "Done.";
+      renderFrogResults(msg);
+      btn.disabled = false;
+      eventSource.close();
+      if (CURRENT_FROG_EVENTSOURCE === eventSource) CURRENT_FROG_EVENTSOURCE = null;
+    }
+  };
+
+  eventSource.onerror = () => {
+    if (modelId !== MODEL_ID) { eventSource.close(); return; }
+    if (!FROG_RESULT) {
+      $("frogStatus").innerHTML = `<span class="error">Connection error while running the FROG report — try again.</span>`;
+    }
+    btn.disabled = false;
+    eventSource.close();
+    if (CURRENT_FROG_EVENTSOURCE === eventSource) CURRENT_FROG_EVENTSOURCE = null;
+  };
+}
+
+function renderFrogResults(data) {
+  const obj = data.objective || {};
+  $("frogResults").innerHTML = `
+    <div class="frog-obj-card">
+      <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(obj.objective_reaction || "—")}</div><div class="mini-stat-label">Objective reaction</div></div>
+      <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(obj.status || "—")}</div><div class="mini-stat-label">Status</div></div>
+      <div class="mini-stat"><div class="mini-stat-value">${fmt(obj.value)}</div><div class="mini-stat-label">Objective value (O)</div></div>
+    </div>
+    <h3>Flux variability analysis (F)</h3>
+    <div id="frogFvaWrap"></div>
+    <h3>Reaction deletions (R)</h3>
+    <div id="frogRxnDelWrap"></div>
+    <h3>Gene deletions (G)</h3>
+    <div id="frogGeneDelWrap"></div>
+    <div id="frogSaveSection" style="margin-top:22px; border-top:1px solid var(--line); padding-top:16px;">
+      <div class="report-section-title" style="margin-bottom:8px;">Save this FROG report as a standalone HTML file</div>
+      <div id="frogSavePath"></div>
+      <div class="toolbar" style="margin-top:10px;">
+        <button id="frogSaveBtn" type="button">Save FROG report</button>
+        <span id="frogSaveStatus" class="debug-status"></span>
+      </div>
+    </div>
+  `;
+
+  renderFrogFvaTable(data.fva ? data.fva.reactions : null);
+  renderFrogReactionDeletionTable(data.reaction_deletions ? data.reaction_deletions.reactions : null);
+  renderFrogGeneDeletionTable(data.gene_deletions ? data.gene_deletions.genes : null);
+
+  const getPath = attachSavePathPicker($("frogSavePath"), "frogSavePath", frogDefaultFilename());
+  $("frogSaveBtn").addEventListener("click", async () => {
+    const saveBtn = $("frogSaveBtn");
+    saveBtn.disabled = true;
+    $("frogSaveStatus").textContent = "Saving…";
+    const html = buildFrogReportHtml(data);
+    const result = await saveGeneratedHtml(html, getPath(), frogDefaultFilename());
+    $("frogSaveStatus").innerHTML = result.ok ? escapeHtml(result.message) : `<span class="error">${escapeHtml(result.message)}</span>`;
+    saveBtn.disabled = false;
+  });
+}
+
+function renderFrogFvaTable(rows) {
+  const wrap = $("frogFvaWrap");
+  if (!rows) { wrap.innerHTML = `<div class="note">Not computed (unchecked before running).</div>`; return; }
+  if (!rows.length) { wrap.innerHTML = `<div class="note">No reactions.</div>`; return; }
+  wrap.innerHTML = `
+    <div class="toolbar"><button id="frogFvaExportBtn" type="button">Export table to CSV</button></div>
+    <div class="table-wrap"><table id="frogFvaTable">
+      <thead><tr><th data-key="id">Reaction ID</th><th data-key="minimum">Minimum flux</th><th data-key="maximum">Maximum flux</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.minimum, 6)}</td><td class="num">${fmt(r.maximum, 6)}</td></tr>`).join("")}</tbody>
+    </table></div>
+  `;
+  $("frogFvaExportBtn").addEventListener("click", () => exportTableToCsv("frog_fva.csv", FROG_FVA_CSV_COLUMNS, rows));
+  setTimeout(() => makeSortable("frogFvaTable", rows, renderFrogFvaTable), 0);
+}
+
+function renderFrogReactionDeletionTable(rows) {
+  const wrap = $("frogRxnDelWrap");
+  if (!rows) { wrap.innerHTML = `<div class="note">Not computed (unchecked before running).</div>`; return; }
+  if (!rows.length) { wrap.innerHTML = `<div class="note">No reactions.</div>`; return; }
+  wrap.innerHTML = `
+    <div class="toolbar"><button id="frogRxnDelExportBtn" type="button">Export table to CSV</button></div>
+    <div class="table-wrap"><table id="frogRxnDelTable">
+      <thead><tr><th data-key="id">Reaction ID</th><th data-key="growth">Growth after knockout</th><th data-key="status">Status</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.growth, 6)}</td><td>${escapeHtml(r.status)}</td></tr>`).join("")}</tbody>
+    </table></div>
+  `;
+  $("frogRxnDelExportBtn").addEventListener("click", () => exportTableToCsv("frog_reaction_deletions.csv", FROG_REACTION_DELETION_CSV_COLUMNS, rows));
+  setTimeout(() => makeSortable("frogRxnDelTable", rows, renderFrogReactionDeletionTable), 0);
+}
+
+function renderFrogGeneDeletionTable(rows) {
+  const wrap = $("frogGeneDelWrap");
+  if (!rows) { wrap.innerHTML = `<div class="note">Not computed (unchecked before running).</div>`; return; }
+  if (!rows.length) { wrap.innerHTML = `<div class="note">No genes.</div>`; return; }
+  wrap.innerHTML = `
+    <div class="toolbar"><button id="frogGeneDelExportBtn" type="button">Export table to CSV</button></div>
+    <div class="table-wrap"><table id="frogGeneDelTable">
+      <thead><tr><th data-key="id">Gene ID</th><th data-key="growth">Growth after knockout</th><th data-key="status">Status</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.growth, 6)}</td><td>${escapeHtml(r.status)}</td></tr>`).join("")}</tbody>
+    </table></div>
+  `;
+  $("frogGeneDelExportBtn").addEventListener("click", () => exportTableToCsv("frog_gene_deletions.csv", FROG_GENE_DELETION_CSV_COLUMNS, rows));
+  setTimeout(() => makeSortable("frogGeneDelTable", rows, renderFrogGeneDeletionTable), 0);
+}
+
+// Body markup shared by both the standalone FROG report (below) and the
+// FROG section embedded in the combined Generate Report (further down).
+function buildFrogSectionBody(data) {
+  const obj = data.objective || {};
+  return `
+    <h2 id="sec-frog">FROG report</h2>
+    <div class="report-note">${escapeHtml(data.note || "")}</div>
+    <h3>Objective (O)</h3>
+    ${staticTableHtml(
+      [{ key: "objective_reaction", label: "Objective reaction" }, { key: "status", label: "Status" }, { key: "value", label: "Value" }],
+      [obj]
+    )}
+    <h3>Flux variability analysis (F)</h3>
+    ${data.fva
+      ? `<div class="report-meta">Fraction of optimum: ${fmt(data.fva.fraction_of_optimum, 4)}</div>${staticTableHtml(FROG_FVA_CSV_COLUMNS, data.fva.reactions, { emptyMessage: "No reactions." })}`
+      : `<div class="report-note">Not included in this run.</div>`}
+    <h3>Reaction deletions (R)</h3>
+    ${data.reaction_deletions
+      ? staticTableHtml(FROG_REACTION_DELETION_CSV_COLUMNS, data.reaction_deletions.reactions, { emptyMessage: "No reactions." })
+      : `<div class="report-note">Not included in this run.</div>`}
+    <h3>Gene deletions (G)</h3>
+    ${data.gene_deletions
+      ? staticTableHtml(FROG_GENE_DELETION_CSV_COLUMNS, data.gene_deletions.genes, { emptyMessage: "No genes." })
+      : `<div class="report-note">Not included in this run.</div>`}
+  `;
+}
+
+function buildFrogReportHtml(data) {
+  const modelLabel = DATA && DATA.stats && (DATA.stats.model_name || DATA.stats.model_id) || "model";
+  const body = `
+    <h1>FROG report — ${escapeHtml(modelLabel)}</h1>
+    <div class="report-meta">Generated ${escapeHtml(new Date().toLocaleString())} by the Genome-scale Model Inspector.</div>
+    ${buildFrogSectionBody(data)}
+  `;
+  return reportDocumentHtml(`FROG report — ${modelLabel}`, body);
+}
+
+// ---------------------------------------------------------------------------
+// "Generate report" modal (on-request) -- lets the user pick which sections
+// to include (each recomputed fresh with its own configurable cutoffs,
+// independent of whatever's currently shown in the tabs) and assembles them
+// into one self-contained HTML file, saved the same way as the FROG tab's
+// own "save as HTML" button above.
+// ---------------------------------------------------------------------------
+
+const REPORT_SECTIONS = [
+  { key: "overview", title: "Overview", hint: "Model stats, compartments, and the diet/media summary." },
+  { key: "metabolites", title: "Metabolites", hint: "The full metabolite table." },
+  { key: "reactions", title: "Reactions", hint: "The full reaction table." },
+  { key: "objective", title: "Objective", hint: "Objective metabolites and their coefficients." },
+  { key: "exchanges", title: "Exchange essentiality", hint: "Every exchange, tested for knockout essentiality." },
+  { key: "minimal_medium", title: "Minimal medium", hint: "Smallest nutrient set for a chosen growth cutoff.", cutoff: true },
+  { key: "network_gaps", title: "Network gaps (blocked reactions & dead ends)", hint: "Structural connectivity gaps under the model's current bounds." },
+  { key: "demand_sink_audit", title: "Demand & sink audit", hint: "Every demand/sink reaction's usage and knockout essentiality." },
+  { key: "pathway_tracer", title: "Pathway tracer", hint: "Included only if you've already run a trace this session.", requiresTracer: true },
+  { key: "frog", title: "FROG report (F/R/O/G reproducibility check)", hint: "Can be slow for large models — configure below.", frog: true },
+];
+
+function reportDefaultFilename() {
+  const name = DATA && DATA.stats && (DATA.stats.model_id || DATA.stats.model_name);
+  return `${sanitizeForFilename(name)}_report.html`;
+}
+
+function closeReportModal() {
+  const overlay = $("reportModalOverlay");
+  if (overlay) overlay.remove();
+}
+
+function renderReportModal() {
+  closeReportModal();
+  const root = $("reportModalRoot");
+  root.innerHTML = `
+    <div class="modal-overlay" id="reportModalOverlay">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h2>Generate report</h2>
+          <button class="modal-close" id="reportModalCloseBtn" type="button">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="note">
+            Pick which sections to include and, for the ones that need it, a cutoff. Each section is recomputed
+            fresh with the settings below — independent of whatever's currently shown in the tabs — then assembled
+            into one self-contained HTML file.
+          </div>
+          <div id="reportSectionList"></div>
+          <div id="reportSavePath" style="margin-top:18px;"></div>
+        </div>
+        <div class="modal-footer">
+          <span class="modal-status" id="reportModalStatus"></span>
+          <button id="reportGenerateBtn" type="button">Generate report</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  $("reportModalCloseBtn").addEventListener("click", closeReportModal);
+  $("reportModalOverlay").addEventListener("click", ev => {
+    if (ev.target.id === "reportModalOverlay") closeReportModal();
+  });
+
+  const listEl = $("reportSectionList");
+  listEl.innerHTML = REPORT_SECTIONS.map(sec => {
+    const disabled = sec.requiresTracer && !TRACER_RESULT;
+    let opts = "";
+    if (sec.cutoff) {
+      opts = `<div class="report-section-opts">
+        <label>Growth cutoff (0–1) <input type="number" id="reportCutoff_${sec.key}" min="0.01" max="1" step="0.01" value="1.0"></label>
+      </div>`;
+    }
+    if (sec.frog) {
+      opts = `<div class="report-section-opts">
+        <label>FVA cutoff (0–1) <input type="number" id="reportFrogFraction" min="0" max="1" step="0.01" value="1.0"></label>
+        <label><input type="checkbox" id="reportFrogFva" checked> Include FVA (F)</label>
+        <label><input type="checkbox" id="reportFrogRxnDel" checked> Include reaction deletions (R)</label>
+        <label><input type="checkbox" id="reportFrogGeneDel" checked> Include gene deletions (G)</label>
+      </div>`;
+    }
+    return `
+      <label class="report-section-row">
+        <input type="checkbox" id="reportSection_${sec.key}" ${disabled ? "disabled" : "checked"}>
+        <div class="report-section-main">
+          <div class="report-section-title">${escapeHtml(sec.title)}</div>
+          <div class="report-section-hint">${escapeHtml(disabled ? "Run a pathway trace first to include it." : sec.hint)}</div>
+          ${opts}
+        </div>
+      </label>
+    `;
+  }).join("");
+
+  const getPath = attachSavePathPicker($("reportSavePath"), "reportSavePath", reportDefaultFilename());
+  $("reportGenerateBtn").addEventListener("click", () => runGenerateReport(getPath));
+}
+
+function runFrogReportForModal(fraction, includeFva, includeRxnDel, includeGeneDel, setStatus) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      fva_fraction: String(fraction),
+      include_fva: includeFva ? "1" : "0",
+      include_reaction_deletions: includeRxnDel ? "1" : "0",
+      include_gene_deletions: includeGeneDel ? "1" : "0",
+    });
+    const eventSource = new EventSource(`/api/frog-report/${MODEL_ID}?${params.toString()}`);
+    eventSource.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (err) { return; }
+      if (msg.type === "info") {
+        setStatus(msg.message);
+      } else if (msg.type === "error") {
+        eventSource.close();
+        reject(new Error(msg.message));
+      } else if (msg.type === "complete") {
+        eventSource.close();
+        resolve(msg);
+      }
+    };
+    eventSource.onerror = () => {
+      eventSource.close();
+      reject(new Error("Connection error while running the FROG report."));
+    };
+  });
+}
+
+function reportOverviewSectionHtml() {
+  const s = DATA.stats;
+  const d = DATA.diet;
+  const rows = [
+    { k: "Model ID", v: s.model_id }, { k: "Model name", v: s.model_name || "—" },
+    { k: "Genes", v: s.genes }, { k: "Metabolites", v: s.metabolites }, { k: "Reactions", v: s.reactions },
+    { k: "Compartments", v: s.compartments }, { k: "Objective direction", v: s.objective_direction },
+    { k: "WT optimization", v: s.wt_status }, { k: "WT objective value", v: s.wt_growth }, { k: "Solver", v: s.solver },
+  ];
+  const dietNote = d ? `<div class="report-note"><strong>Diet:</strong> ${escapeHtml(d.mode)} — ${escapeHtml(d.note || "")}</div>` : "";
+  return `
+    <h2 id="sec-overview">Overview</h2>
+    ${staticTableHtml([{ key: "k", label: "Field" }, { key: "v", label: "Value" }], rows)}
+    ${dietNote}
+  `;
+}
+
+function reportMetabolitesSectionHtml() {
+  const cols = [
+    { key: "id", label: "ID" }, { key: "name", label: "Name" }, { key: "compartment", label: "Compartment" },
+    { key: "formula", label: "Formula" }, { key: "charge", label: "Charge" },
+  ];
+  return `<h2 id="sec-metabolites">Metabolites</h2>${staticTableHtml(cols, DATA.metabolites, { emptyMessage: "No metabolites." })}`;
+}
+
+function reportReactionsSectionHtml() {
+  const cols = [
+    { key: "id", label: "ID" }, { key: "name", label: "Name" }, { key: "type", label: "Type" },
+    { key: "subsystem", label: "Subsystem" }, { key: "lower_bound", label: "LB" }, { key: "upper_bound", label: "UB" },
+    { key: "wt_flux", label: "WT flux" }, { key: "gene_reaction_rule", label: "GPR" },
+  ];
+  return `<h2 id="sec-reactions">Reactions</h2>${staticTableHtml(cols, DATA.reactions, { emptyMessage: "No reactions." })}`;
+}
+
+function reportObjectiveSectionHtml() {
+  const cols = [
+    { key: "metabolite_id", label: "Metabolite ID" }, { key: "metabolite_name", label: "Metabolite name" },
+    { key: "compartment", label: "Compartment" }, { key: "coefficient", label: "Coefficient" },
+    { key: "direct_exchange", label: "Direct exchange" }, { key: "appears_in_reactions", label: "In reactions" },
+  ];
+  return `<h2 id="sec-objective">Objective</h2>${staticTableHtml(cols, DATA.objective_metabolites || [], { emptyMessage: "No objective metabolites." })}`;
+}
+
+function reportExchangesSectionHtml() {
+  const cols = [
+    { key: "id", label: "Exchange" }, { value: r => join(r.metabolite_names) || join(r.metabolites), label: "Metabolite" },
+    { key: "lower_bound", label: "LB" }, { key: "upper_bound", label: "UB" }, { key: "wt_flux", label: "WT flux" },
+    { value: r => (r.uptake_allowed ? "Yes" : "No"), label: "Uptake allowed" },
+    { key: "ko_growth_fraction", label: "Growth retained after KO" },
+    { value: r => (r.essential ? "Yes" : "No"), label: "Essential" },
+  ];
+  return `<h2 id="sec-exchanges">Exchange essentiality</h2>${staticTableHtml(cols, DATA.exchanges || [], { emptyMessage: "No exchange data (essentiality test may not have finished yet)." })}`;
+}
+
+function reportMinimalMediumSectionHtml(data) {
+  return `
+    <h2 id="sec-minmed">Minimal medium</h2>
+    <div class="report-note">${escapeHtml(data.note || "")}</div>
+    ${staticTableHtml(MINMED_CSV_COLUMNS, data.components || [], { emptyMessage: "No components." })}
+  `;
+}
+
+function reportNetworkGapsSectionHtml(data) {
+  return `
+    <h2 id="sec-gaps">Network gaps</h2>
+    <div class="report-note">${escapeHtml(data.note || "")}</div>
+    <h3>Blocked reactions</h3>
+    ${staticTableHtml(NETGAPS_BLOCKED_CSV_COLUMNS, data.blocked_reactions || [], { emptyMessage: "No blocked reactions." })}
+    <h3>Dead-end metabolites</h3>
+    ${staticTableHtml(NETGAPS_DEADEND_CSV_COLUMNS, data.dead_end_metabolites || [], { emptyMessage: "No dead-end metabolites." })}
+  `;
+}
+
+function reportDemandSinkSectionHtml(data) {
+  return `
+    <h2 id="sec-dsaudit">Demand &amp; sink audit</h2>
+    <div class="report-note">${escapeHtml(data.note || "")}</div>
+    ${staticTableHtml(DSAUDIT_CSV_COLUMNS, data.rows || [], { emptyMessage: "No demand or sink reactions." })}
+  `;
+}
+
+function reportTracerSectionHtml(result) {
+  const rows = (result.paths || []).map((p, i) => ({
+    path: `Path ${i + 1}`,
+    steps: p.reactions.map((rxn, idx) => `${rxn.id} (flux=${fmt(rxn.flux)}) -> ${p.metabolites[idx + 1].id}`).join("  ;  "),
+  }));
+  return `
+    <h2 id="sec-tracer">Pathway tracer (most recent trace)</h2>
+    <div class="report-meta">${escapeHtml(result.start_id)} → ${escapeHtml(result.target_metabolite.id)} — ${result.paths.length} path(s), growth ${fmt(result.growth)}.</div>
+    ${staticTableHtml([{ key: "path", label: "Path" }, { key: "steps", label: "Steps" }], rows, { emptyMessage: "No paths found." })}
+  `;
+}
+
+async function runGenerateReport(getPath) {
+  const statusEl = $("reportModalStatus");
+  const btn = $("reportGenerateBtn");
+  btn.disabled = true;
+
+  const setStatus = (msg, isError) => {
+    statusEl.innerHTML = isError ? `<span class="error">${escapeHtml(msg)}</span>` : escapeHtml(msg);
+  };
+
+  try {
+    if (!MODEL_ID) throw new Error("Model session expired — please re-run the initial analysis.");
+
+    const wantSections = {};
+    REPORT_SECTIONS.forEach(sec => {
+      const cb = $(`reportSection_${sec.key}`);
+      wantSections[sec.key] = !!(cb && cb.checked && !cb.disabled);
+    });
+
+    const sectionsHtml = [];
+    const tocEntries = [];
+
+    // Overview / Metabolites / Reactions / Objective / Exchanges are already
+    // in memory from the initial analysis -- no re-fetch needed.
+    if (wantSections.overview) {
+      sectionsHtml.push(reportOverviewSectionHtml());
+      tocEntries.push(["overview", "Overview"]);
+    }
+    if (wantSections.metabolites) {
+      sectionsHtml.push(reportMetabolitesSectionHtml());
+      tocEntries.push(["metabolites", "Metabolites"]);
+    }
+    if (wantSections.reactions) {
+      sectionsHtml.push(reportReactionsSectionHtml());
+      tocEntries.push(["reactions", "Reactions"]);
+    }
+    if (wantSections.objective) {
+      sectionsHtml.push(reportObjectiveSectionHtml());
+      tocEntries.push(["objective", "Objective"]);
+    }
+    if (wantSections.exchanges) {
+      sectionsHtml.push(reportExchangesSectionHtml());
+      tocEntries.push(["exchanges", "Exchange essentiality"]);
+    }
+    if (wantSections.minimal_medium) {
+      setStatus("Computing minimal medium…");
+      const cutoffInput = $("reportCutoff_minimal_medium");
+      let cutoff = parseFloat(cutoffInput ? cutoffInput.value : 1.0);
+      if (!Number.isFinite(cutoff) || cutoff <= 0) cutoff = 1.0;
+      cutoff = Math.max(0.01, Math.min(1, cutoff));
+      const res = await fetch("/api/minimal-medium", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: MODEL_ID, growth_cutoff_fraction: cutoff }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || "Minimal medium computation failed.");
+      sectionsHtml.push(reportMinimalMediumSectionHtml(data));
+      tocEntries.push(["minmed", "Minimal medium"]);
+    }
+    if (wantSections.network_gaps) {
+      setStatus("Computing network gaps (blocked reactions & dead ends)…");
+      const res = await fetch("/api/network-gaps", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: MODEL_ID }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || "Network gaps computation failed.");
+      sectionsHtml.push(reportNetworkGapsSectionHtml(data));
+      tocEntries.push(["gaps", "Network gaps"]);
+    }
+    if (wantSections.demand_sink_audit) {
+      setStatus("Running demand & sink audit…");
+      const res = await fetch("/api/demand-sink-audit", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: MODEL_ID }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || "Demand & sink audit failed.");
+      sectionsHtml.push(reportDemandSinkSectionHtml(data));
+      tocEntries.push(["dsaudit", "Demand & sink audit"]);
+    }
+    if (wantSections.pathway_tracer && TRACER_RESULT) {
+      sectionsHtml.push(reportTracerSectionHtml(TRACER_RESULT));
+      tocEntries.push(["tracer", "Pathway tracer"]);
+    }
+    if (wantSections.frog) {
+      setStatus("Running FROG report (this can take a while for large models)…");
+      const fraction = parseFloat(($("reportFrogFraction") || {}).value) || 1.0;
+      const includeFva = $("reportFrogFva") ? $("reportFrogFva").checked : true;
+      const includeRxnDel = $("reportFrogRxnDel") ? $("reportFrogRxnDel").checked : true;
+      const includeGeneDel = $("reportFrogGeneDel") ? $("reportFrogGeneDel").checked : true;
+      const frogData = await runFrogReportForModal(fraction, includeFva, includeRxnDel, includeGeneDel, setStatus);
+      sectionsHtml.push(buildFrogSectionBody(frogData));
+      tocEntries.push(["frog", "FROG report"]);
+    }
+
+    if (!sectionsHtml.length) throw new Error("Select at least one section to include.");
+
+    setStatus("Assembling final report…");
+    const toc = `<div class="toc"><strong>Contents</strong><ul>${tocEntries.map(([id, label]) => `<li><a href="#sec-${id}">${escapeHtml(label)}</a></li>`).join("")}</ul></div>`;
+    const modelLabel = (DATA.stats && (DATA.stats.model_name || DATA.stats.model_id)) || "model";
+    const body = `
+      <h1>Model Inspector report — ${escapeHtml(modelLabel)}</h1>
+      <div class="report-meta">Generated ${escapeHtml(new Date().toLocaleString())} by the Genome-scale Model Inspector. WT growth: ${fmt(DATA.wt_growth)}.</div>
+      ${toc}
+      ${sectionsHtml.join("\n")}
+    `;
+    const html = reportDocumentHtml(`Model report — ${modelLabel}`, body);
+
+    setStatus("Saving…");
+    const result = await saveGeneratedHtml(html, getPath(), reportDefaultFilename());
+    setStatus(result.message, !result.ok);
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
 }

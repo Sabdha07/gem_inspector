@@ -60,6 +60,13 @@ A small local Flask + COBRApy UI for inspecting a genome-scale metabolic model.
     - **Dead-end metabolites** — metabolites that can only ever be produced or only ever be consumed given their reactions' current bounds/reversibility
     - **Demand & sink audit** — every demand/sink reaction's bounds, WT usage, and knockout essentiality
     - all three tables sortable and independently exportable to CSV
+14. FROG Report tab (on request, as soon as the model loads):
+    - the model-reproducibility check standard used in the SBML/COMBINE community: **F**lux variability analysis, **R**eaction deletions, **O**bjective value, **G**ene deletions, all against the model's current bounds
+    - F's growth cutoff (fraction of optimum) is configurable; F/R/G can each be skipped independently since R and G are one LP solve per reaction/gene and can be slow on a large genome-scale model
+    - all three result tables sortable and independently exportable to CSV; the whole report can also be saved as its own standalone HTML file
+15. Generate report (on request, once a model is analyzed):
+    - a "Generate report…" button assembles any combination of the sections above (with their own cutoffs, recomputed fresh) into a single self-contained HTML file
+    - lets you pick a save location (native "Save As" dialog when running locally, or a plain browser download otherwise)
 
 ## Essentiality definition
 
@@ -144,9 +151,26 @@ A separate, on-request tab — visible as soon as the model loads — with three
 - **Dead-end metabolites** — a fast, purely structural check (no optimization involved) for metabolites that, given each of their reactions' current bounds/reversibility, can only ever be produced or only ever be consumed — never both. This is often *why* a reaction ends up blocked, though a reaction can also be blocked for more global network reasons a local per-metabolite check can't see, which is why this and the blocked-reactions check are shown together rather than one substituting for the other.
 - **Demand & sink audit** — every demand and sink reaction (`model.demands` / `model.sinks` — single-metabolite boundary reactions distinct from exchanges, so they don't appear in the Exchange essentiality tab) with its metabolite, bounds, whether it carries flux in the current FBA solution, and the same reaction-knockout essentiality test used for exchanges (KO growth < 5% of WT growth). A demand/sink that's unused and non-essential is a reasonable candidate for pruning; one that's unused but silently essential can be a sign of an over-permissive reaction papering over a thermodynamically unrealistic loop.
 
+## FROG Report tab
+
+A separate, on-request tab — visible as soon as the model loads — for FROG, the model-reproducibility check standard used across the SBML/COMBINE community. It runs four pieces against the model's current bounds (whatever diet was applied at upload) so this model + medium can be cross-checked against any other FBA tool's results for the same inputs:
+
+- **O**bjective — a single FBA optimum (near-instant, always computed).
+- **F**lux variability analysis — minimum and maximum flux for every reaction, at a configurable growth cutoff (fraction of optimum; 1.0 fixes flux at the model's own maximum growth, lower values allow more variability).
+- **R**eaction deletions — the objective value after knocking out each reaction in the model, one at a time (every reaction, not just exchanges — unlike the Exchange essentiality tab).
+- **G**ene deletions — the objective value after knocking out each gene in the model, one at a time.
+
+F, R, and G can each be unchecked to skip them — R and G are one LP solve per reaction/gene, so on a large genome-scale model they're by far the slowest part; F is two solves per reaction. All three result tables are sortable and independently exportable to CSV, same as elsewhere in the app. A **Save FROG report** button below the results assembles the whole thing (objective + all three tables) into one self-contained HTML file — see "Generate report" below for how the save location is chosen. Like every other on-request tab, running a FROG report never changes the model being analyzed elsewhere in the app, and the same `glpk_exact` numerical-robustness fix described below is applied to F/R/G's repeated LP solves.
+
+## Generate report
+
+A **Generate report…** button, next to the tabs once a model is analyzed, opens a dialog listing every section above (Overview, Metabolites, Reactions, Objective, Exchange essentiality, Minimal medium, Network gaps, Demand & sink audit, the most recent Pathway Tracer result if you've run one, and FROG) as a checkbox, each with its own cutoff where relevant (minimal medium's growth cutoff; FROG's FVA cutoff and F/R/G toggles). Every checked section is recomputed fresh with the settings in the dialog — independent of whatever's currently shown in the tabs — then assembled into a single self-contained HTML file (a table of contents at the top links to each included section).
+
+For the save location, click **Browse…** to open your operating system's native "Save As" dialog (this only works because the app and your browser are on the same computer — it runs a short-lived helper process on this machine, so it has no effect and fails gracefully if the app is ever accessed over a network from a different machine); or type a full path directly; or leave it blank to download the report straight through your browser instead.
+
 ## Numerical robustness note (GLPK on Windows)
 
-Two operations in this app — "Minimal media" (both the diet option and the Minimal Medium tab) and the Network Gaps tab's blocked-reactions check — have been observed to trigger a fatal `glp_free: memory allocation error` crash on some GLPK/Windows builds: one from solving a single very poorly-scaled LP (forcing every exchange wide open), the other from re-solving the same LP many times in a row (flux variability analysis). Because this is a crash inside GLPK's own C code, Python cannot catch or recover from it — it takes down the whole server process. Both operations now run on GLPK's exact-arithmetic interface (`glpk_exact`) instead of the default floating-point solver, which sidesteps both failure modes (COBRApy's own `minimal_medium` docs list "switching to a different solver" as the standard remedy for numerical instability). The trade-off is slower solves for these two specific computations; everything else in the app keeps using the fast default solver.
+Some operations in this app — "Minimal media" (both the diet option and the Minimal Medium tab), the Network Gaps tab's blocked-reactions check, and the FROG Report tab's F/R/G computations — have been observed to trigger a fatal `glp_free: memory allocation error` crash on some GLPK/Windows builds: one failure mode comes from solving a single very poorly-scaled LP (forcing every exchange wide open), the other from re-solving the same LP many times in a row (flux variability analysis, or one solve per reaction/gene for deletions). Because this is a crash inside GLPK's own C code, Python cannot catch or recover from it — it takes down the whole server process. All of these now run on GLPK's exact-arithmetic interface (`glpk_exact`) instead of the default floating-point solver, which sidesteps both failure modes (COBRApy's own `minimal_medium` docs list "switching to a different solver" as the standard remedy for numerical instability). The trade-off is slower solves for these specific computations; everything else in the app keeps using the fast default solver.
 
 ## Notes
 

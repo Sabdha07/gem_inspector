@@ -6,6 +6,8 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import time
 import threading
@@ -23,7 +25,12 @@ from cobra.io import (
     load_yaml_model,
     read_sbml_model,
 )
-from cobra.flux_analysis import find_blocked_reactions
+from cobra.flux_analysis import (
+    find_blocked_reactions,
+    flux_variability_analysis,
+    single_gene_deletion,
+    single_reaction_deletion,
+)
 from cobra.medium import minimal_medium
 from cobra.util import linear_reaction_coefficients
 
@@ -97,7 +104,8 @@ TRIVIAL_METABOLITES = {
     "itp", "idp", "imp",
     "nad", "nadh", "nadp", "nadph",
     "fad", "fadh2",
-    "coa", "co_a",
+    "coa", "co_a", 
+    "co2", 
     "q8", "q8h2", "mqn8", "mql8",
 }
 
@@ -1460,6 +1468,253 @@ def compute_demand_sink_audit(model):
         ),
     }
 
+# ---------------------------------------------------------------------------
+# FROG report (on-request, its own tab): the reproducibility-check standard
+# used across the SBML/COMBINE community for genome-scale metabolic models --
+# F(lux variability analysis), R(eaction deletions), O(bjective value), and
+# G(ene deletions), all run against the model's current bounds (whatever diet
+# was applied at upload). Any other FBA tool analyzing the same model + the
+# same medium can be cross-checked against these same four results, which is
+# the whole point of the standard.
+#
+# F/R/G can each be individually skipped -- for a large genome-scale model
+# they're the slow parts (one LP solve per reaction for F's minimize +
+# maximize, one per reaction for R, one per gene for G), whereas O is a
+# single, near-instant solve. FVA's growth cutoff (fraction_of_optimum) is
+# configurable, same as the Minimal Medium tab's cutoff.
+#
+# All the actual LP solving reuses cobra's own bulk analysis functions,
+# forced to processes=1 (see compute_network_gaps_report above for why:
+# Windows "spawn" multiprocessing is fragile/slow to invoke from inside a
+# live Flask request) and wrapped in run_with_exact_solver -- this class of
+# repeated-solve computation is exactly what has been observed to crash
+# GLPK's default solver on this Windows build (see run_with_exact_solver's
+# own docstring).
+# ---------------------------------------------------------------------------
+
+def compute_frog_objective(model):
+    """The 'O' in FROG: a single FBA optimum under the model's current
+    bounds (whatever diet was applied at upload)."""
+    solution = model.optimize()
+    return {
+        "objective_reaction": find_biomass_reaction(model),
+        "status": str(solution.status),
+        "value": safe_float(solution.objective_value),
+    }
+
+def compute_frog_fva(model, fraction_of_optimum=1.0):
+    """The 'F' in FROG: flux variability analysis on every reaction in the
+    model at the given fraction_of_optimum (1.0 = fixed at the model's own
+    maximum growth; lower values allow more flux variability)."""
+    try:
+        fraction_of_optimum = float(fraction_of_optimum)
+    except (TypeError, ValueError):
+        fraction_of_optimum = 1.0
+    fraction_of_optimum = max(0.0, min(1.0, fraction_of_optimum))
+
+    df = run_with_exact_solver(
+        model,
+        lambda: flux_variability_analysis(
+            model, reaction_list=None, fraction_of_optimum=fraction_of_optimum, processes=1,
+        ),
+    )
+    rows = [
+        {"id": rxn_id, "minimum": safe_float(row["minimum"]), "maximum": safe_float(row["maximum"])}
+        for rxn_id, row in df.iterrows()
+    ]
+    rows.sort(key=lambda r: r["id"])
+    return {"fraction_of_optimum": fraction_of_optimum, "reactions": rows}
+
+def compute_frog_reaction_deletions(model):
+    """The 'R' in FROG: single-reaction-deletion objective value for every
+    reaction in the model (not just exchanges -- unlike the Exchange
+    essentiality tab, this is every reaction, per the FROG standard)."""
+    if not model.reactions:
+        return {"reactions": []}
+    df = run_with_exact_solver(model, lambda: single_reaction_deletion(model, processes=1))
+    rows = []
+    for _, row in df.iterrows():
+        ids = row["ids"]
+        rxn_id = next(iter(ids)) if ids else None
+        rows.append({"id": rxn_id, "growth": safe_float(row["growth"]), "status": str(row["status"])})
+    rows.sort(key=lambda r: (r["id"] is None, r["id"]))
+    return {"reactions": rows}
+
+def compute_frog_gene_deletions(model):
+    """The 'G' in FROG: single-gene-deletion objective value for every gene
+    in the model."""
+    if not model.genes:
+        return {"genes": []}
+    df = run_with_exact_solver(model, lambda: single_gene_deletion(model, processes=1))
+    rows = []
+    for _, row in df.iterrows():
+        ids = row["ids"]
+        gene_id = next(iter(ids)) if ids else None
+        rows.append({"id": gene_id, "growth": safe_float(row["growth"]), "status": str(row["status"])})
+    rows.sort(key=lambda r: (r["id"] is None, r["id"]))
+    return {"genes": rows}
+
+def stream_frog_report(model, fva_fraction, include_fva, include_reaction_deletions, include_gene_deletions):
+    """Generator that yields FROG-report progress over SSE, one stage at a
+    time. O is computed first (near-instant, and needed regardless), then
+    F/R/G in that order, each skippable by the caller. Yields a final
+    "complete" event carrying every computed piece, or an "error" event (and
+    stops) if any stage raises."""
+    yield "data: " + json.dumps({"type": "info", "message": "Computing objective value (O)…"}) + "\n\n"
+    try:
+        objective = compute_frog_objective(model)
+    except Exception as exc:
+        yield "data: " + json.dumps({"type": "error", "message": f"Objective computation failed: {exc}"}) + "\n\n"
+        return
+
+    fva_result = None
+    if include_fva:
+        yield "data: " + json.dumps({
+            "type": "info",
+            "message": f"Running flux variability analysis (F) on {len(model.reactions)} reaction(s)…",
+        }) + "\n\n"
+        try:
+            fva_result = compute_frog_fva(model, fva_fraction)
+        except Exception as exc:
+            yield "data: " + json.dumps({"type": "error", "message": f"FVA failed: {exc}"}) + "\n\n"
+            return
+
+    reaction_deletions = None
+    if include_reaction_deletions:
+        yield "data: " + json.dumps({
+            "type": "info",
+            "message": f"Running single-reaction deletions (R) on {len(model.reactions)} reaction(s)…",
+        }) + "\n\n"
+        try:
+            reaction_deletions = compute_frog_reaction_deletions(model)
+        except Exception as exc:
+            yield "data: " + json.dumps({"type": "error", "message": f"Reaction deletions failed: {exc}"}) + "\n\n"
+            return
+
+    gene_deletions = None
+    if include_gene_deletions:
+        yield "data: " + json.dumps({
+            "type": "info",
+            "message": f"Running single-gene deletions (G) on {len(model.genes)} gene(s)…",
+        }) + "\n\n"
+        try:
+            gene_deletions = compute_frog_gene_deletions(model)
+        except Exception as exc:
+            yield "data: " + json.dumps({"type": "error", "message": f"Gene deletions failed: {exc}"}) + "\n\n"
+            return
+
+    note = (
+        "FROG: a model-reproducibility check standard used in the SBML/COMBINE community -- Flux variability "
+        "analysis, Reaction deletions, Objective value, Gene deletions -- computed against this model's current "
+        "bounds, so it can be cross-checked against any other FBA tool analyzing the same model and medium."
+    )
+    yield "data: " + json.dumps({
+        "type": "complete",
+        "objective": objective,
+        "fva": fva_result,
+        "reaction_deletions": reaction_deletions,
+        "gene_deletions": gene_deletions,
+        "note": note,
+    }) + "\n\n"
+
+# ---------------------------------------------------------------------------
+# "Generate report" (on-request): assembles a self-contained HTML file out of
+# whichever sections/analyses the user picks (with their own cutoffs), built
+# client-side from data already fetched via the on-request endpoints above --
+# this backend only needs to know how to get that finished HTML onto disk.
+#
+# Two ways to get it there:
+#   - /api/browse-save-path opens a native "Save As" dialog IN A SEPARATE
+#     HELPER PROCESS (never inside the Flask process/thread itself) so the
+#     user can pick any location on their own machine -- meaningful only
+#     because this Flask server and the browser are expected to be running
+#     on the same computer, exactly the local-desktop-use pattern this app
+#     is built for. If no GUI is available here (no tkinter, no display),
+#     it fails softly and the frontend falls back to a plain text field, or
+#     a plain browser download.
+#   - /api/save-report writes a given HTML string straight to a given path.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/browse-save-path")
+def api_browse_save_path():
+    """Best-effort native "Save As" dialog for the generated report, run in
+    a short-lived helper subprocess so it never shares a thread or event
+    loop with the Flask server itself. Returns {"path": "..."} on success,
+    {"path": null} if the user cancelled, or {"path": null, "error": "..."}
+    when no GUI is available here (the frontend then falls back to typing a
+    path manually, or a plain browser download)."""
+    default_name = (request.args.get("default_name") or "model_report.html").strip()
+    default_name = secure_filename(default_name) or "model_report.html"
+    if not default_name.lower().endswith((".html", ".htm")):
+        default_name += ".html"
+
+    script = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "try:\n"
+        "    root.attributes('-topmost', True)\n"
+        "except Exception:\n"
+        "    pass\n"
+        "path = filedialog.asksaveasfilename(\n"
+        "    defaultextension='.html',\n"
+        "    filetypes=[('HTML files', '*.html'), ('All files', '*.*')],\n"
+        f"    initialfile={default_name!r},\n"
+        "    title='Save model report as...',\n"
+        ")\n"
+        "print(path)\n"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as exc:
+        return jsonify({"path": None, "error": f"Could not open a save dialog here: {exc}"})
+
+    if result.returncode != 0:
+        stderr_lines = (result.stderr or "").strip().splitlines()
+        reason = stderr_lines[-1] if stderr_lines else "unknown error"
+        return jsonify({"path": None, "error": f"Save dialog unavailable here: {reason}"})
+
+    path = (result.stdout or "").strip()
+    return jsonify({"path": path or None})
+
+@app.post("/api/save-report")
+def api_save_report():
+    """Write a generated report's HTML directly to a path on this machine.
+    The report itself is assembled client-side (from data already fetched
+    via the on-request endpoints above) -- this endpoint only ever receives
+    the finished HTML string and a destination path. Only meaningful when
+    the browser and this Flask process share a filesystem, i.e. the local-
+    desktop-use pattern this app assumes; the frontend falls back to a
+    plain browser download when no path is given."""
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    path_str = (data.get("path") or "").strip()
+    html = data.get("html")
+    if not path_str:
+        return jsonify({"error": "No save path given."}), 400
+    if html is None:
+        return jsonify({"error": "No report content given."}), 400
+
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        return jsonify({"error": "Save path must be an absolute path (use Browse…, or type a full path)."}), 400
+    if path.suffix.lower() not in (".html", ".htm"):
+        path = path.with_name(path.name + ".html")
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html, encoding="utf-8")
+    except Exception as exc:
+        return jsonify({"error": f"Could not write the report to '{path}': {exc}"}), 500
+
+    return jsonify({"status": "success", "path": str(path)})
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -1653,6 +1908,45 @@ def api_demand_sink_audit():
     if "error" in report:
         return jsonify({"status": "error", **report}), 400
     return jsonify({"status": "success", **report})
+
+@app.get("/api/frog-report/<model_id>")
+def api_frog_report(model_id):
+    """Stream the FROG report (see stream_frog_report) for an already-cached
+    model. GET + EventSource, same pattern as /api/analyze-ko. Query args:
+    fva_fraction (default 1.0), include_fva/include_reaction_deletions/
+    include_gene_deletions (each "0"/"false"/"no" to skip, default on)."""
+    if model_id not in MODEL_CACHE:
+        return jsonify({"error": "Model not found or expired"}), 404
+
+    model, _ = MODEL_CACHE[model_id]
+
+    def parse_bool(name, default=True):
+        raw = request.args.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in ("0", "false", "no", "")
+
+    try:
+        fva_fraction = float(request.args.get("fva_fraction", 1.0))
+    except (TypeError, ValueError):
+        fva_fraction = 1.0
+    include_fva = parse_bool("include_fva", True)
+    include_reaction_deletions = parse_bool("include_reaction_deletions", True)
+    include_gene_deletions = parse_bool("include_gene_deletions", True)
+
+    def generate():
+        try:
+            for line in stream_frog_report(
+                model, fva_fraction, include_fva, include_reaction_deletions, include_gene_deletions
+            ):
+                yield line
+        finally:
+            touch_model_cache(model_id)
+
+    return Response(generate(), mimetype='text/event-stream', headers={
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+    })
 
 @app.post("/api/debug-exchanges")
 def api_debug_exchanges():
@@ -1956,5 +2250,5 @@ def api_trace_pathway():
 
 if __name__ == "__main__":
     app.run(
-        host="127.0.0.1", 
+        host="127.0.0.1",
         port=5000, debug=True)

@@ -46,6 +46,10 @@
   <section id="app" class="hidden">
     <div class="summary" id="summary"></div>
 
+    <div class="app-toolbar">
+      <button id="reportBtn" type="button">📄 Generate report…</button>
+    </div>
+
     <nav class="tabs">
       <button class="tab active" data-tab="overview">Overview</button>
       <button class="tab" data-tab="metabolites">Metabolites</button>
@@ -56,6 +60,7 @@
       <button class="tab" data-tab="debug" id="debugTab" style="display:none;">Exchange Debugging</button>
       <button class="tab" data-tab="tracer">Pathway Tracer</button>
       <button class="tab" data-tab="gaps">Network Gaps &amp; Audits</button>
+      <button class="tab" data-tab="frog">FROG Report</button>
     </nav>
 
     <section id="overview" class="panel active"></section>
@@ -67,8 +72,11 @@
     <section id="debug" class="panel"></section>
     <section id="tracer" class="panel"></section>
     <section id="gaps" class="panel"></section>
+    <section id="frog" class="panel"></section>
   </section>
 </main>
+
+<div id="reportModalRoot"></div>
 
 <script src="/static/vendor/cytoscape.min.js"></script>
 <script src="/static/app.js"></script>
