@@ -41,6 +41,24 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 .panel { display:none; padding:20px; }
 .panel.active { display:block; }
 .toolbar { display:flex; gap:9px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+
+/* Per-table "Columns" visibility picker + CSV/TSV export (attachTableTools
+   in app.js), dropped into a table's existing .toolbar row. */
+.table-tools { display:flex; gap:8px; margin-left:auto; }
+.tt-dropdown { position:relative; }
+.tt-btn { background:#fff; border:1px solid #cbd5e1; font-weight:600; font-size:12.5px; padding:8px 12px; }
+.tt-btn:hover { background:#f8fafc; }
+.tt-panel {
+  position:absolute; right:0; top:calc(100% + 4px); z-index:20;
+  background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:var(--shadow);
+  padding:10px 12px; min-width:190px; max-height:320px; overflow:auto;
+}
+.tt-panel-wide { min-width:230px; }
+.tt-panel-title { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; margin-bottom:6px; }
+.tt-check { display:flex; align-items:center; gap:7px; font-size:12.5px; padding:3px 0; cursor:pointer; white-space:nowrap; }
+.tt-export-cols { display:flex; flex-direction:column; max-height:220px; overflow:auto; border-bottom:1px solid var(--line); margin-bottom:8px; padding-bottom:6px; }
+.tt-export-actions { display:flex; gap:8px; }
+.tt-export-actions button { flex:1; background:var(--accent); color:#fff; font-size:12px; padding:8px 6px; }
 input[type=text], select { border:1px solid #cbd5e1; border-radius:8px; padding:9px 10px; background:#fff; min-width:180px; }
 .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:10px; max-height:600px; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -49,6 +67,10 @@ th { position:sticky; top:0; background:#f8fafc; z-index:1; }
 th.sortable { cursor:pointer; user-select:none; }
 th.sortable:hover { background:#eff6ff; }
 td.wrap { white-space:normal; min-width:250px; }
+/* Name columns (Metabolites, Objective) narrowed to ~60% of their previous
+   unconstrained auto-width, with the full name on hover for anything that
+   gets truncated. */
+th.col-name-md, td.col-name-md { max-width:210px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .badge { display:inline-block; padding:3px 7px; border-radius:999px; font-size:11px; font-weight:700; background:#eef2ff; color:#3730a3; }
 .badge.good { background:var(--good-bg); color:var(--good); }
 .badge.bad { background:var(--bad-bg); color:var(--bad); }
@@ -57,6 +79,8 @@ td.wrap { white-space:normal; min-width:250px; }
 .kv dd { margin:0; font-weight:600; }
 .objective-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }
 .objective-card { border:1px solid var(--line); border-radius:12px; padding:16px; }
+.annot-value { font-size:16px; font-weight:700; margin:4px 0 2px; }
+.chip-row { display:flex; flex-wrap:wrap; gap:7px; }
 .stoich { color:var(--muted); font-size:12px; margin-top:8px; }
 .note { padding:10px 12px; background:#fffbeb; border:1px solid #fde68a; border-radius:9px; color:#854d0e; margin-bottom:14px; }
 .error { padding:12px; background:var(--bad-bg); color:var(--bad); border-radius:9px; }

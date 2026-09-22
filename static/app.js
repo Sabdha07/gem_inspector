@@ -267,6 +267,151 @@ function exportTableToCsv(filename, columns, rows) {
   URL.revokeObjectURL(url);
 }
 
+// ---------------------------------------------------------------------------
+// Per-table "Columns" visibility picker + CSV/TSV export, shared by every
+// data table in the app. Call attachTableTools(tableId, toolbarEl, columns,
+// getRows, exportBaseName) once, right after a table's <thead> (with one
+// <th> per entry in `columns`, in the same order) has been put in the DOM.
+//
+// getRows() must return the table's CURRENT on-screen rows -- whatever the
+// active filter/sort is showing right now, not the full unfiltered dataset
+// -- so export always matches what the user is looking at.
+//
+// The "Columns" picker only hides/shows cells on screen (via a per-table
+// <style> block keyed on column position, since sorting only reorders rows,
+// never columns). The "Export" picker is a *separate* set of checkboxes
+// (defaulted to the same visible set) so a one-off export can include a
+// different column selection than what's currently shown, without touching
+// the on-screen table.
+// ---------------------------------------------------------------------------
+const TABLE_COLUMN_STATE = {}; // tableId -> Set of visible column keys
+
+function tableColumnState(tableId, columns) {
+  if (!TABLE_COLUMN_STATE[tableId]) {
+    TABLE_COLUMN_STATE[tableId] = new Set(columns.map(c => c.key));
+  }
+  return TABLE_COLUMN_STATE[tableId];
+}
+
+function applyColumnVisibility(tableId, columns) {
+  const visible = tableColumnState(tableId, columns);
+  let css = "";
+  columns.forEach((c, i) => {
+    if (!visible.has(c.key)) {
+      css += `#${tableId} th:nth-child(${i + 1}), #${tableId} td:nth-child(${i + 1}) { display:none; }\n`;
+    }
+  });
+  const styleElId = `${tableId}-colstyle`;
+  let styleEl = document.getElementById(styleElId);
+  if (!styleEl) {
+    styleEl = document.createElement("style");
+    styleEl.id = styleElId;
+    document.head.appendChild(styleEl);
+  }
+  styleEl.textContent = css;
+}
+
+function delimCell(value, delimiter) {
+  if (value === null || value === undefined) return "";
+  const s = String(value);
+  const re = delimiter === "\t" ? /["\t\r\n]/ : /[",\r\n]/;
+  return re.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function downloadDelimited(filename, columns, rows, delimiter) {
+  const header = columns.map(c => delimCell(c.label, delimiter)).join(delimiter);
+  const lines = (rows || []).map(row =>
+    columns.map(c => delimCell(typeof c.value === "function" ? c.value(row) : row[c.key], delimiter)).join(delimiter)
+  );
+  const text = [header, ...lines].join("\r\n");
+  const mime = delimiter === "\t" ? "text/tab-separated-values;charset=utf-8;" : "text/csv;charset=utf-8;";
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Closes every open Columns/Export popover except (optionally) one.
+function closeAllTableToolPanels(except) {
+  document.querySelectorAll(".tt-panel").forEach(p => { if (p !== except) p.classList.add("hidden"); });
+}
+document.addEventListener("click", () => closeAllTableToolPanels());
+
+// `columns` must match the table's actual <th> order 1:1 (drives on-screen
+// show/hide). `exportColumns` (optional, defaults to `columns`) is what the
+// Export panel offers -- it can include extra fields that aren't shown as
+// table columns at all (e.g. a full reaction string), since export doesn't
+// need positional alignment with the DOM the way visibility does.
+function attachTableTools(tableId, toolbarEl, columns, getRows, exportBaseName, exportColumns) {
+  if (!toolbarEl) return;
+  exportColumns = exportColumns || columns;
+  applyColumnVisibility(tableId, columns);
+  const visible = tableColumnState(tableId, columns);
+  const exportKeyOf = (c, i) => c.key || `col${i}`;
+
+  const wrap = document.createElement("div");
+  wrap.className = "table-tools";
+  wrap.innerHTML = `
+    <div class="tt-dropdown">
+      <button type="button" class="tt-btn" data-tt="cols-${tableId}">Columns ▾</button>
+      <div class="tt-panel hidden" data-tt-panel="cols-${tableId}">
+        <div class="tt-panel-title">Show columns</div>
+        ${columns.map(c => `<label class="tt-check"><input type="checkbox" data-role="vis" value="${escapeHtml(c.key)}" ${visible.has(c.key) ? "checked" : ""}> ${escapeHtml(c.label)}</label>`).join("")}
+      </div>
+    </div>
+    <div class="tt-dropdown">
+      <button type="button" class="tt-btn" data-tt="exp-${tableId}">Export ▾</button>
+      <div class="tt-panel hidden tt-panel-wide" data-tt-panel="exp-${tableId}">
+        <div class="tt-panel-title">Columns to export</div>
+        <div class="tt-export-cols">
+          ${exportColumns.map((c, i) => `<label class="tt-check"><input type="checkbox" data-role="exp" value="${escapeHtml(exportKeyOf(c, i))}" ${(!c.key || visible.has(c.key)) ? "checked" : ""}> ${escapeHtml(c.label)}</label>`).join("")}
+        </div>
+        <div class="tt-export-actions">
+          <button type="button" data-fmt="csv">Download CSV</button>
+          <button type="button" data-fmt="tsv">Download TSV</button>
+        </div>
+      </div>
+    </div>
+  `;
+  toolbarEl.appendChild(wrap);
+
+  wrap.querySelector(`[data-tt-panel="cols-${tableId}"]`).addEventListener("change", (ev) => {
+    if (ev.target.dataset.role !== "vis") return;
+    const key = ev.target.value;
+    if (ev.target.checked) visible.add(key); else visible.delete(key);
+    applyColumnVisibility(tableId, columns);
+  });
+
+  wrap.querySelectorAll('[data-fmt]').forEach(btn => {
+    btn.addEventListener("click", () => {
+      const panel = wrap.querySelector(`[data-tt-panel="exp-${tableId}"]`);
+      const chosenKeys = new Set([...panel.querySelectorAll('input[data-role="exp"]:checked')].map(el => el.value));
+      const chosenCols = exportColumns.filter((c, i) => chosenKeys.has(exportKeyOf(c, i)));
+      if (!chosenCols.length) { window.alert("Choose at least one column to export."); return; }
+      const delim = btn.dataset.fmt === "tsv" ? "\t" : ",";
+      downloadDelimited(`${exportBaseName}.${btn.dataset.fmt}`, chosenCols, getRows(), delim);
+      closeAllTableToolPanels();
+    });
+  });
+
+  wrap.querySelectorAll(".tt-btn").forEach(btn => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const key = btn.dataset.tt;
+      const panel = wrap.querySelector(`[data-tt-panel="${key}"]`);
+      const isOpen = !panel.classList.contains("hidden");
+      closeAllTableToolPanels();
+      if (!isOpen) panel.classList.remove("hidden");
+    });
+  });
+  wrap.addEventListener("click", (ev) => ev.stopPropagation());
+}
+
 // Make table sortable by adding click handlers to headers
 function makeSortable(tableId, rows, renderFn) {
   const table = $(tableId);
@@ -338,22 +483,58 @@ function renderSummary() {
   ).join("");
 }
 
+// One "ID annotation" detail card (namespace or compartment convention) for
+// the Overview tab — label, the detected value, an example id, and (for a
+// namespace) what fraction of ids matched it.
+function annotationCardHtml(title, label, example, coveragePct) {
+  const pct = coveragePct != null ? `<div class="mini-stat-label">${fmt(coveragePct, 1)}% of ids matched</div>` : "";
+  return `
+    <div class="objective-card">
+      <div class="mini-stat-label">${escapeHtml(title)}</div>
+      <div class="annot-value">${escapeHtml(label || "Unknown")}</div>
+      ${example ? `<div class="stoich">e.g. <code>${escapeHtml(example)}</code></div>` : ""}
+      ${pct}
+    </div>
+  `;
+}
+
 function renderOverview() {
   const s = DATA.stats;
   const d = DATA.diet;
+  const ns = s.namespace_metabolites || {};
+  const nsR = s.namespace_reactions || {};
+  const conv = s.compartment_convention || {};
+
   $("overview").innerHTML = `
     <h2>Model overview</h2>
+    <div class="mini-stats">
+      <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(s.metabolites)}</div><div class="mini-stat-label">Metabolites</div></div>
+      <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(s.reactions)}</div><div class="mini-stat-label">Reactions</div></div>
+      <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(s.genes)}</div><div class="mini-stat-label">Genes</div></div>
+      <div class="mini-stat"><div class="mini-stat-value">${fmt(s.wt_growth)}</div><div class="mini-stat-label">WT growth</div></div>
+      <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(s.solver)}</div><div class="mini-stat-label">Solver</div></div>
+    </div>
+
+    <h3>ID namespace &amp; compartment annotation</h3>
+    <div class="objective-grid">
+      ${annotationCardHtml("ID namespace — metabolites", ns.label, ns.example, ns.coverage != null ? ns.coverage * 100 : null)}
+      ${annotationCardHtml("ID namespace — reactions", nsR.label, nsR.example, nsR.coverage != null ? nsR.coverage * 100 : null)}
+      ${annotationCardHtml("Compartment annotation", conv.label, conv.example, null)}
+    </div>
+
+    <h3>Compartments</h3>
+    <div class="chip-row">${s.compartment_details.map(c => {
+      const extra = c.raw_name && c.raw_name !== c.name ? ` (model-provided name: ${c.raw_name})` : "";
+      return `<span class="badge" title="Compartment code: ${escapeHtml(c.id)}${escapeHtml(extra)}">${escapeHtml(c.name)}</span>`;
+    }).join(" ")}</div>
+
+    <h3>Other details</h3>
     <dl class="kv">
       <dt>Model ID</dt><dd>${escapeHtml(s.model_id)}</dd>
       <dt>Model name</dt><dd>${escapeHtml(s.model_name || "—")}</dd>
       <dt>Objective direction</dt><dd>${escapeHtml(s.objective_direction)}</dd>
       <dt>WT optimization</dt><dd>${escapeHtml(s.wt_status)}</dd>
-      <dt>WT objective value</dt><dd>${fmt(s.wt_growth)}</dd>
     </dl>
-    <h3>Compartments</h3>
-    <div>${s.compartment_details.map(c =>
-      `<span class="badge" title="${escapeHtml(c.raw_name && c.raw_name !== c.name ? `Model-provided name: ${c.raw_name}` : "")}">${escapeHtml(c.id)}: ${escapeHtml(c.name)}</span> `
-    ).join("")}</div>
     ${d ? renderDietSummary(d) : ""}
     <h3>Analysis rule</h3>
     <div class="note">${escapeHtml(DATA.essentiality_rule)}</div>
@@ -374,9 +555,56 @@ function renderDietSummary(d) {
   return html;
 }
 
+function reactionStatsHtml(rows) {
+  const total = rows.length;
+  const byType = {};
+  rows.forEach(r => { byType[r.type] = (byType[r.type] || 0) + 1; });
+  const withGpr = rows.filter(r => (r.gene_reaction_rule || "").trim()).length;
+  const withSub = rows.filter(r => (r.subsystem || "").trim()).length;
+
+  const typeCards = Object.keys(byType).sort().map(t => {
+    const info = REACTION_TYPE_INFO[t];
+    return `
+    <div class="mini-stat"${info ? ` title="${escapeHtml(info)}"` : ""}>
+      <div class="mini-stat-value">${byType[t]}</div>
+      <div class="mini-stat-label">${escapeHtml(t)} <span class="stoich">${total ? fmt(100 * byType[t] / total, 1) : "0"}%</span></div>
+    </div>`;
+  }).join("");
+
+  return `
+    <h3>Reaction statistics</h3>
+    <div class="mini-stats">
+      ${typeCards}
+      <div class="mini-stat" title="Fraction of reactions that have a gene-protein-reaction (GPR) rule assigned.">
+        <div class="mini-stat-value">${total ? fmt(100 * withGpr / total, 1) : "0"}%</div>
+        <div class="mini-stat-label">Have a GPR <span class="stoich">${withGpr}/${total}</span></div>
+      </div>
+      <div class="mini-stat" title="Fraction of reactions that have a subsystem assigned.">
+        <div class="mini-stat-value">${total ? fmt(100 * withSub / total, 1) : "0"}%</div>
+        <div class="mini-stat-label">Have a subsystem <span class="stoich">${withSub}/${total}</span></div>
+      </div>
+    </div>
+  `;
+}
+
+const REACTION_TABLE_COLUMNS = [
+  { key: "id", label: "Original ID" },
+  { key: "metanetx_id", label: "MetaNetX ID" },
+  { key: "name", label: "Name" },
+  { key: "type", label: "Type" },
+  { key: "subsystem", label: "Subsystem" },
+  { key: "gene_reaction_rule", label: "GPR" },
+  { key: "compartments", label: "Compartment", value: r => (r.compartments || []).map(c => COMP_NAMES[c] || c).join("; ") },
+  { key: "wt_flux", label: "WT flux" },
+];
+
+let rxnCurrentRows = [];
+
 function renderReactions() {
   const types = [...new Set(DATA.reactions.map(r => r.type))].sort();
   $("reactions").innerHTML = `
+    ${reactionStatsHtml(DATA.reactions)}
+    <h3>Reactions</h3>
     <div class="toolbar">
       <input id="rxnSearch" type="text" placeholder="Search ID, name, subsystem…">
       <select id="rxnType"><option value="">All types</option>${types.map(t => `<option>${escapeHtml(t)}</option>`).join("")}</select>
@@ -385,15 +613,14 @@ function renderReactions() {
     </div>
     <div class="table-wrap"><table id="rxnTable">
       <thead><tr>
-        <th data-key="id">ID</th>
+        <th data-key="id">Original ID</th>
+        <th data-key="metanetx_id">MetaNetX ID</th>
         <th data-key="name">Name</th>
         <th data-key="type">Type</th>
         <th data-key="subsystem">Subsystem</th>
-        <th data-key="compartments">Compartments</th>
-        <th data-key="lower_bound">LB</th>
-        <th data-key="upper_bound">UB</th>
-        <th data-key="wt_flux">WT flux</th>
         <th data-key="gene_reaction_rule">GPR</th>
+        <th data-key="compartments">Comp</th>
+        <th data-key="wt_flux">WT flux</th>
       </tr></thead>
       <tbody id="rxnBody"></tbody>
     </table></div>
@@ -403,37 +630,67 @@ function renderReactions() {
     const type = $("rxnType").value;
     const sub = $("rxnSubsystem").value;
     const rows = filtered ? filtered : DATA.reactions.filter(r =>
-      (!q || `${r.id} ${r.name} ${r.subsystem} ${r.gene_reaction_rule}`.toLowerCase().includes(q)) &&
+      (!q || `${r.id} ${r.metanetx_id || ""} ${r.name} ${r.subsystem} ${r.gene_reaction_rule}`.toLowerCase().includes(q)) &&
       (!type || r.type === type) && (!sub || r.subsystem === sub)
     );
+    rxnCurrentRows = rows;
     $("rxnCount").textContent = `${rows.length} / ${DATA.reactions.length}`;
     $("rxnBody").innerHTML = rows.map(r => `<tr>
-      <td><strong>${escapeHtml(r.id)}</strong></td><td class="wrap">${escapeHtml(r.name)}</td>
-      <td><span class="badge">${escapeHtml(r.type)}</span></td><td>${escapeHtml(r.subsystem || "—")}</td>
-      <td>${compartmentBadges(r.compartments)}</td><td class="num">${fmt(r.lower_bound, 2)}</td><td class="num">${fmt(r.upper_bound, 2)}</td>
-      <td class="num">${fmt(r.wt_flux)}</td><td class="wrap">${escapeHtml(r.gene_reaction_rule || "—")}</td>
+      <td><strong>${escapeHtml(r.id)}</strong></td>
+      <td>${escapeHtml(r.metanetx_id || "—")}</td>
+      <td class="wrap">${escapeHtml(r.name)}</td>
+      <td>${reactionTypeBadge(r.type)}</td><td>${escapeHtml(r.subsystem || "—")}</td>
+      <td class="wrap">${escapeHtml(r.gene_reaction_rule || "—")}</td>
+      <td>${compartmentBadges(r.compartments)}</td>
+      <td class="num">${fmt(r.wt_flux)}</td>
     </tr>`).join("");
   };
   ["rxnSearch","rxnType","rxnSubsystem"].forEach(id => $(id).addEventListener("input", () => redraw()));
   redraw();
   setTimeout(() => makeSortable("rxnTable", DATA.reactions, redraw), 0);
+  attachTableTools("rxnTable", $("reactions").querySelector(".toolbar"), REACTION_TABLE_COLUMNS, () => rxnCurrentRows, "reactions");
 }
+
+const METABOLITE_TABLE_COLUMNS = [
+  { key: "id", label: "Original ID" },
+  { key: "metanetx_id", label: "MetaNetX ID" },
+  { key: "name", label: "Name" },
+  { key: "compartment", label: "Compartment", value: m => COMP_NAMES[m.compartment] || m.compartment || "" },
+  { key: "formula", label: "Formula" },
+  { key: "charge", label: "Charge" },
+  { key: "reaction_count", label: "# Reactions" },
+  { key: "produced_count", label: "# Produced in" },
+  { key: "consumed_count", label: "# Consumed in" },
+  { key: "reversible_count", label: "# Reversible" },
+];
+
+let metCurrentRows = [];
 
 function renderMetabolites() {
   const comps = [...new Set(DATA.metabolites.map(m => m.compartment).filter(Boolean))].sort();
   $("metabolites").innerHTML = `
     <div class="toolbar">
       <input id="metSearch" type="text" placeholder="Search metabolite ID, name, formula…">
-      <select id="metComp"><option value="">All compartments</option>${comps.map(c => `<option>${escapeHtml(c)}</option>`).join("")}</select>
+      <select id="metComp"><option value="">All compartments</option>${comps.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(COMP_NAMES[c] || c)}</option>`).join("")}</select>
+      <select id="metMapped">
+        <option value="">MetaNetX: all</option>
+        <option value="mapped">MetaNetX: mapped only</option>
+        <option value="unmapped">MetaNetX: unmapped only</option>
+      </select>
       <span id="metCount"></span>
     </div>
     <div class="table-wrap"><table id="metTable">
       <thead><tr>
-        <th data-key="id">ID</th>
-        <th data-key="name">Name</th>
+        <th data-key="id">Original ID</th>
+        <th data-key="metanetx_id">MetaNetX ID</th>
+        <th data-key="name" class="col-name-md">Name</th>
         <th data-key="compartment">Compartment</th>
         <th data-key="formula">Formula</th>
         <th data-key="charge">Charge</th>
+        <th data-key="reaction_count"># Reactions</th>
+        <th data-key="produced_count"># Produced in</th>
+        <th data-key="consumed_count"># Consumed in</th>
+        <th data-key="reversible_count"># Reversible</th>
       </tr></thead>
       <tbody id="metBody"></tbody>
     </table></div>
@@ -441,21 +698,44 @@ function renderMetabolites() {
   const redraw = (filtered) => {
     const q = $("metSearch").value.toLowerCase();
     const comp = $("metComp").value;
+    const mapped = $("metMapped").value;
     const rows = filtered ? filtered : DATA.metabolites.filter(m =>
-      (!q || `${m.id} ${m.name} ${m.formula}`.toLowerCase().includes(q)) &&
-      (!comp || m.compartment === comp)
+      (!q || `${m.id} ${m.metanetx_id || ""} ${m.name} ${m.formula}`.toLowerCase().includes(q)) &&
+      (!comp || m.compartment === comp) &&
+      (!mapped || (mapped === "mapped" ? !!m.metanetx_id : !m.metanetx_id))
     );
+    metCurrentRows = rows;
     $("metCount").textContent = `${rows.length} / ${DATA.metabolites.length}`;
     $("metBody").innerHTML = rows.map(m => `<tr>
-      <td><strong id="met-${escapeHtml(m.id)}">${escapeHtml(m.id)}</strong></td><td>${escapeHtml(m.name)}</td>
+      <td><strong id="met-${escapeHtml(m.id)}">${escapeHtml(m.id)}</strong></td>
+      <td>${escapeHtml(m.metanetx_id || "—")}</td>
+      <td class="col-name-md" title="${escapeHtml(m.name)}">${escapeHtml(m.name)}</td>
       <td>${compartmentBadges([m.compartment])}</td>
       <td>${escapeHtml(m.formula || "—")}</td><td>${escapeHtml(m.charge ?? "—")}</td>
+      <td class="num">${m.reaction_count ?? 0}</td>
+      <td class="num">${m.produced_count ?? 0}</td>
+      <td class="num">${m.consumed_count ?? 0}</td>
+      <td class="num">${m.reversible_count ?? 0}</td>
     </tr>`).join("");
   };
-  ["metSearch","metComp"].forEach(id => $(id).addEventListener("input", () => redraw()));
+  ["metSearch","metComp","metMapped"].forEach(id => $(id).addEventListener("input", () => redraw()));
   redraw();
   setTimeout(() => makeSortable("metTable", DATA.metabolites, redraw), 0);
+  attachTableTools("metTable", $("metabolites").querySelector(".toolbar"), METABOLITE_TABLE_COLUMNS, () => metCurrentRows, "metabolites");
 }
+
+const EXCHANGE_TABLE_COLUMNS = [
+  { key: "id", label: "Exchange", value: r => `${r.id}${r.name ? ` (${r.name})` : ""}` },
+  { key: "metabolite_names", label: "Metabolite", value: r => join(r.metabolite_names) || join(r.metabolites) },
+  { key: "lower_bound", label: "LB" },
+  { key: "upper_bound", label: "UB" },
+  { key: "wt_flux", label: "WT flux" },
+  { key: "uptake_allowed", label: "Uptake?", value: r => r.uptake_allowed ? "Yes" : "No" },
+  { key: "ko_growth_fraction", label: "Growth retained after KO" },
+  { key: "essential", label: "Essential?", value: r => r.essential ? "ESSENTIAL" : "No" },
+];
+
+let exCurrentRows = [];
 
 function renderExchanges() {
   const exchanges = DATA.exchanges || [];
@@ -519,6 +799,7 @@ function renderExchanges() {
       const matchUp = !uptake || (uptake === "yes" ? r.uptake_allowed : !r.uptake_allowed);
       return matchQ && matchEss && matchUp;
     });
+    exCurrentRows = rows;
     $("exCount").textContent = `${rows.length} / ${exchanges.length}`;
     $("exBody").innerHTML = rows.map(r => `<tr data-row-id="${escapeHtml(r.id)}" class="${r.essential ? "row-essential" : ""}">
       <td><strong>${escapeHtml(r.id)}</strong><br><span class="stoich">${escapeHtml(r.name)}</span></td>
@@ -533,6 +814,7 @@ function renderExchanges() {
   redraw();
   setTimeout(() => makeSortable("exTable", exchanges, redraw), 0);
   attachRowTooltip("exBody", byId, buildExchangeTooltipHtml);
+  attachTableTools("exTable", $("exchanges").querySelector(".toolbar"), EXCHANGE_TABLE_COLUMNS, () => exCurrentRows, "exchange_essentiality");
 }
 
 // A small inline bar visualizing what fraction of WT growth survives the
@@ -615,63 +897,135 @@ function attachRowTooltip(tbodyId, rowsById, buildHtml) {
   tbody.addEventListener("mouseleave", () => { hideTooltip(); lastRowId = null; });
 }
 
+// Small colored tag for a metabolite's net role in the biomass/objective
+// reaction(s) specifically -- distinct from the per-model produced/consumed
+// *counts* further down the row, which tally every reaction in the model.
+const BIOMASS_ROLE_INFO = {
+  produced: "Net produced by the objective/biomass reaction(s) (positive net stoichiometric coefficient).",
+  consumed: "Net consumed by the objective/biomass reaction(s) (negative net stoichiometric coefficient) -- a biomass building block.",
+  neutral: "Net coefficient in the objective/biomass reaction(s) is zero (cancels out across multiple objective reactions, if more than one).",
+};
+function biomassRoleBadge(role) {
+  const cls = role === "produced" ? "good" : role === "consumed" ? "bad" : "";
+  const info = BIOMASS_ROLE_INFO[role];
+  return `<span class="badge ${cls}"${info ? ` title="${escapeHtml(info)}"` : ""}>${escapeHtml(role || "—")}</span>`;
+}
+
+const OBJECTIVE_TABLE_COLUMNS = [
+  { key: "metabolite_id", label: "Original ID" },
+  { key: "metabolite_metanetx_id", label: "MetaNetX ID" },
+  { key: "metabolite_name", label: "Name" },
+  { key: "compartment", label: "Compartment", value: o => COMP_NAMES[o.compartment] || o.compartment || "" },
+  { key: "coefficient", label: "Coefficient" },
+  { key: "biomass_role", label: "Biomass role" },
+  { key: "direct_exchange", label: "Direct Exchange?" },
+  // { key: "appears_in_reactions", label: "In Objective Reactions" },
+  { key: "reaction_count", label: "# Reactions (model-wide)" },
+  { key: "produced_count", label: "# Produced in" },
+  { key: "consumed_count", label: "# Consumed in" },
+  { key: "reversible_count", label: "# Reversible" },
+];
+
+let objCurrentRows = [];
+
 function renderObjective() {
   $("objective").innerHTML = `
     <div class="toolbar">
       <input id="objSearch" type="text" placeholder="Filter metabolite or exchange…">
+      <select id="objBiomassRole">
+        <option value="">Biomass role: all</option>
+        <option value="produced">Biomass role: produced</option>
+        <option value="consumed">Biomass role: consumed</option>
+      </select>
     </div>
     <div class="table-wrap"><table id="objTable">
       <thead><tr>
-        <th data-key="metabolite_id">Metabolite ID</th>
-        <th data-key="metabolite_name">Metabolite Name</th>
+        <th data-key="metabolite_id">Original ID</th>
+        <th data-key="metabolite_metanetx_id">MetaNetX ID</th>
+        <th data-key="metabolite_name" class="col-name-md">Name</th>
         <th data-key="compartment">Compartment</th>
         <th data-key="coefficient">Coefficient</th>
+        <th data-key="biomass_role">Biomass role</th>
         <th data-key="direct_exchange">Direct Exchange?</th>
-        <th data-key="appears_in_reactions">In Reactions</th>
+        <!-- <th data-key="appears_in_reactions">In Objective Reactions</th> -->
+        <th data-key="reaction_count"># Reactions (model-wide)</th>
+        <th data-key="produced_count"># Produced in</th>
+        <th data-key="consumed_count"># Consumed in</th>
+        <th data-key="reversible_count"># Reversible</th>
       </tr></thead>
       <tbody id="objBody"></tbody>
     </table></div>
   `;
-  
+
   const redraw = (filtered) => {
     const q = $("objSearch").value.toLowerCase();
+    const role = $("objBiomassRole").value;
     const rows = filtered ? filtered : (DATA.objective_metabolites || []).filter(o =>
-      !q || `${o.metabolite_id} ${o.metabolite_name} ${o.direct_exchange || ""}`.toLowerCase().includes(q)
+      (!q || `${o.metabolite_id} ${o.metabolite_metanetx_id || ""} ${o.metabolite_name} ${o.direct_exchange || ""}`.toLowerCase().includes(q)) &&
+      (!role || o.biomass_role === role)
     );
-    
+    objCurrentRows = rows;
+
     $("objBody").innerHTML = rows.length > 0 ? rows.map(o => `<tr>
       <td><strong><a href="#met-${escapeHtml(o.metabolite_id)}" style="cursor:pointer;color:inherit;text-decoration:underline;">${escapeHtml(o.metabolite_id)}</a></strong></td>
-      <td>${escapeHtml(o.metabolite_name || "—")}</td>
-      <td><span class="badge">${escapeHtml(o.compartment || "—")}</span></td>
+      <td>${escapeHtml(o.metabolite_metanetx_id || "—")}</td>
+      <td class="col-name-md" title="${escapeHtml(o.metabolite_name || "")}">${escapeHtml(o.metabolite_name || "—")}</td>
+      <td>${compartmentBadges([o.compartment])}</td>
       <td>${fmt(o.coefficient, 8)}</td>
+      <td>${biomassRoleBadge(o.biomass_role)}</td>
       <td>${o.direct_exchange ? `<strong>${escapeHtml(o.direct_exchange)}</strong>` : "—"}</td>
-      <td>${o.appears_in_reactions}</td>
-    </tr>`).join("") : `<tr><td colspan="6" class="note">No objective metabolites found (or all filtered as common).</td></tr>`;
+      <!-- <td class="num">${o.appears_in_reactions}</td> -->
+      <td class="num">${o.reaction_count ?? 0}</td>
+      <td class="num">${o.produced_count ?? 0}</td>
+      <td class="num">${o.consumed_count ?? 0}</td>
+      <td class="num">${o.reversible_count ?? 0}</td>
+    </tr>`).join("") : `<tr><td colspan="12" class="note">No objective metabolites found (or all filtered as common).</td></tr>`;
   };
-  
-  $("objSearch").addEventListener("input", () => redraw());
+
+  ["objSearch","objBiomassRole"].forEach(id => $(id).addEventListener("input", () => redraw()));
   redraw();
   setTimeout(() => makeSortable("objTable", DATA.objective_metabolites || [], redraw), 0);
+  attachTableTools("objTable", $("objective").querySelector(".toolbar"), OBJECTIVE_TABLE_COLUMNS, () => objCurrentRows, "objective_metabolites");
 }
 
 function formatStoich(rows) {
   if (!rows || !rows.length) return "—";
-  return rows.map(x => `${fmt(Math.abs(x.coefficient), 8)} × ${escapeHtml(x.name || x.id)} <span class="badge">${escapeHtml(x.id)} [${escapeHtml(x.compartment || "?")}]</span>`).join("<br>");
+  return rows.map(x => `${fmt(Math.abs(x.coefficient), 8)} × ${escapeHtml(x.name || x.id)} <span class="badge" title="Compartment code: ${escapeHtml(x.compartment || "?")}">${escapeHtml(x.id)} [${escapeHtml(COMP_NAMES[x.compartment] || x.compartment || "?")}]</span>`).join("<br>");
 }
 
 function subsystems(rows) {
   return [...new Set(rows.map(r => r.subsystem).filter(Boolean))].sort();
 }
 
-// Compact "code" badge that shows the friendly compartment name on hover,
-// so tables stay narrow while the mapping from earlier ("map the compartment
-// code to a friendly name") is still one hover away wherever a compartment
-// shows up.
+// Plain-language definitions for every reaction classification this app
+// uses (see classify_reactions() in app.py), shown as a hover tooltip
+// wherever the tag itself appears — table cells, stat cards, audit "Kind"
+// columns — so a tag like "demand" is self-explanatory without needing the
+// analysis-rule footnotes. Compartment tags are handled separately by
+// compartmentBadges() below and intentionally don't use this.
+const REACTION_TYPE_INFO = {
+  exchange: "Exchange reaction: a boundary reaction that lets this metabolite enter or leave the system across the model's outer boundary (COBRApy model.exchanges).",
+  demand: "Demand reaction: an irreversible outlet that consumes a metabolite without producing anything, used to drain it out of the system (COBRApy model.demands) — often for a dead-end or a metabolite being force-produced.",
+  sink: "Sink reaction: a reversible outlet allowing a metabolite to be added to or removed from the system, typically for metabolites with an unspecified source or fate (COBRApy model.sinks).",
+  transport: "Transport reaction: its metabolites span more than one compartment, moving material between compartments (heuristic: not exchange/demand/sink, but touches >1 compartment).",
+  internal: "Internal reaction: an ordinary metabolic reaction confined to a single compartment (not exchange, demand, sink, or transport).",
+};
+
+function reactionTypeBadge(type) {
+  const info = REACTION_TYPE_INFO[type];
+  return `<span class="badge"${info ? ` title="${escapeHtml(info)}"` : ""}>${escapeHtml(type)}</span>`;
+}
+
+// Compartment badge showing the full friendly name (e.g. "Cytosol") instead
+// of the raw shorthand code, with the code itself available on hover for
+// anyone who wants to cross-check it against the model file. Used wherever
+// a compartment is displayed, so the full name shows up consistently across
+// every table (Metabolites, Reactions, Objective, Exchanges, Tracer, ...).
 function compartmentBadges(compartmentIds) {
   const ids = (compartmentIds || []).filter(Boolean);
   if (!ids.length) return "—";
   return ids.map(id =>
-    `<span class="badge" title="${escapeHtml(COMP_NAMES[id] || id)}">${escapeHtml(id)}</span>`
+    `<span class="badge" title="Compartment code: ${escapeHtml(id)}">${escapeHtml(COMP_NAMES[id] || id)}</span>`
   ).join(" ");
 }
 
@@ -756,14 +1110,17 @@ const MINMED_CSV_COLUMNS = [
   { key: "uptake_flux", label: "Flux" },
 ];
 
+let minmedCurrentRows = [];
+
 function renderMinimalMediumTable(components) {
+  minmedCurrentRows = components;
   $("minmedCount").textContent = `${components.length} component(s)`;
   if (!components.length) {
     $("minmedResults").innerHTML = `<div class="note">No components returned.</div>`;
     return;
   }
   $("minmedResults").innerHTML = `
-    <div class="toolbar"><button id="minmedExportBtn" type="button">Export table to CSV</button></div>
+    <div class="toolbar"></div>
     <div class="table-wrap"><table id="minmedTable">
       <thead><tr>
         <th data-key="exchange_name">Exchange reaction name</th>
@@ -781,9 +1138,7 @@ function renderMinimalMediumTable(components) {
       </tr>`).join("")}</tbody>
     </table></div>
   `;
-  $("minmedExportBtn").addEventListener("click", () =>
-    exportTableToCsv("minimal_medium.csv", MINMED_CSV_COLUMNS, components)
-  );
+  attachTableTools("minmedTable", $("minmedResults").querySelector(".toolbar"), MINMED_CSV_COLUMNS, () => minmedCurrentRows, "minimal_medium");
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +1169,13 @@ const NETGAPS_DEADEND_CSV_COLUMNS = [
   { key: "name", label: "Metabolite name" },
   { key: "compartment", label: "Compartment" },
   { key: "reason", label: "Reason" },
-  { value: r => join(r.reactions), label: "Reactions involved" },
+  { key: "reactions", value: r => join(r.reactions), label: "Reactions involved" },
 ];
+// Positional subset of NETGAPS_BLOCKED_CSV_COLUMNS matching the Blocked
+// reactions table's actual <th> order (that constant has one extra field,
+// reaction_string, offered only in the Export panel via exportColumns, not
+// shown as its own table column).
+const NETGAPS_BLOCKED_TABLE_COLUMNS = NETGAPS_BLOCKED_CSV_COLUMNS.slice(0, 7);
 
 const NETGAPS_REASON_LABELS = {
   no_consuming_reaction: "Never consumed (only ever produced)",
@@ -910,14 +1270,18 @@ function renderNetworkGapsResults(data) {
   setTimeout(() => makeSortable("gapsDeadendTable", data.dead_end_metabolites || [], renderDeadEndTable), 0);
 }
 
+let gapsBlockedCurrentRows = [];
+let gapsDeadendCurrentRows = [];
+
 function renderBlockedReactionsTable(rows) {
+  gapsBlockedCurrentRows = rows;
   const wrap = $("gapsBlockedWrap");
   if (!rows.length) {
     wrap.innerHTML = `<div class="note">No blocked reactions found under the model's current bounds.</div>`;
     return;
   }
   wrap.innerHTML = `
-    <div class="toolbar"><button id="gapsBlockedExportBtn" type="button">Export table to CSV</button></div>
+    <div class="toolbar"></div>
     <div class="table-wrap"><table id="gapsBlockedTable">
       <thead><tr>
         <th data-key="id">ID</th>
@@ -932,33 +1296,32 @@ function renderBlockedReactionsTable(rows) {
         <td><strong>${escapeHtml(r.id)}</strong></td>
         <td class="wrap">${escapeHtml(r.name || "—")}</td>
         <td>${escapeHtml(r.subsystem || "—")}</td>
-        <td><span class="badge">${escapeHtml(r.type)}</span></td>
+        <td>${reactionTypeBadge(r.type)}</td>
         <td class="num">${fmt(r.lower_bound, 2)}</td>
         <td class="num">${fmt(r.upper_bound, 2)}</td>
         <td class="wrap">${escapeHtml(r.gene_reaction_rule || "—")}</td>
       </tr>`).join("")}</tbody>
     </table></div>
   `;
-  $("gapsBlockedExportBtn").addEventListener("click", () =>
-    exportTableToCsv("blocked_reactions.csv", NETGAPS_BLOCKED_CSV_COLUMNS, rows)
-  );
+  attachTableTools("gapsBlockedTable", wrap.querySelector(".toolbar"), NETGAPS_BLOCKED_TABLE_COLUMNS, () => gapsBlockedCurrentRows, "blocked_reactions", NETGAPS_BLOCKED_CSV_COLUMNS);
 }
 
 function renderDeadEndTable(rows) {
+  gapsDeadendCurrentRows = rows;
   const wrap = $("gapsDeadendWrap");
   if (!rows.length) {
     wrap.innerHTML = `<div class="note">No dead-end metabolites found.</div>`;
     return;
   }
   wrap.innerHTML = `
-    <div class="toolbar"><button id="gapsDeadendExportBtn" type="button">Export table to CSV</button></div>
+    <div class="toolbar"></div>
     <div class="table-wrap"><table id="gapsDeadendTable">
       <thead><tr>
         <th data-key="id">Metabolite ID</th>
         <th data-key="name">Metabolite name</th>
         <th data-key="compartment">Compartment</th>
         <th data-key="reason">Reason</th>
-        <th>Reactions involved</th>
+        <th data-key="reactions">Reactions involved</th>
       </tr></thead>
       <tbody>${rows.map(r => `<tr>
         <td><strong>${escapeHtml(r.id)}</strong></td>
@@ -969,9 +1332,7 @@ function renderDeadEndTable(rows) {
       </tr>`).join("")}</tbody>
     </table></div>
   `;
-  $("gapsDeadendExportBtn").addEventListener("click", () =>
-    exportTableToCsv("dead_end_metabolites.csv", NETGAPS_DEADEND_CSV_COLUMNS, rows)
-  );
+  attachTableTools("gapsDeadendTable", wrap.querySelector(".toolbar"), NETGAPS_DEADEND_CSV_COLUMNS, () => gapsDeadendCurrentRows, "dead_end_metabolites");
 }
 
 let DSAUDIT_RESULT = null;
@@ -990,6 +1351,22 @@ const DSAUDIT_CSV_COLUMNS = [
   { key: "ko_growth", label: "KO growth" },
   { value: r => (r.ko_growth_fraction == null ? "" : r.ko_growth_fraction), label: "KO growth fraction" },
   { value: r => (r.essential ? "Yes" : "No"), label: "Essential?" },
+];
+// Positional subset/reshaping of DSAUDIT_CSV_COLUMNS matching the Demand &
+// sink audit table's actual <th> order (that table merges metabolite
+// name+id into one visible cell and doesn't show compartment/ko_growth as
+// separate columns; the fuller DSAUDIT_CSV_COLUMNS is offered via
+// exportColumns instead).
+const DSAUDIT_TABLE_COLUMNS = [
+  { key: "kind", label: "Kind" },
+  { key: "id", label: "ID" },
+  { key: "name", label: "Name" },
+  { key: "metabolite_id", label: "Metabolite", value: r => r.metabolite_name || r.metabolite_id || "" },
+  { key: "lower_bound", label: "LB" },
+  { key: "upper_bound", label: "UB" },
+  { key: "wt_flux", label: "WT flux" },
+  { key: "ko_growth_fraction", label: "Growth retained after KO" },
+  { key: "essential", label: "Essential?", value: r => (r.essential ? "Yes" : "No") },
 ];
 
 async function runDemandSinkAudit() {
@@ -1027,13 +1404,16 @@ async function runDemandSinkAudit() {
   }
 }
 
+let dsAuditCurrentRows = [];
+
 function renderDemandSinkAuditTable(rows) {
+  dsAuditCurrentRows = rows;
   if (!rows.length) {
     $("dsAuditResults").innerHTML = `<div class="note">No demand or sink reactions found in this model.</div>`;
     return;
   }
   $("dsAuditResults").innerHTML = `
-    <div class="toolbar"><button id="dsAuditExportBtn" type="button">Export table to CSV</button></div>
+    <div class="toolbar"></div>
     <div class="table-wrap"><table id="dsAuditTable">
       <thead><tr>
         <th data-key="kind">Kind</th>
@@ -1047,7 +1427,7 @@ function renderDemandSinkAuditTable(rows) {
         <th data-key="essential">Essential?</th>
       </tr></thead>
       <tbody>${rows.map(r => `<tr class="${r.essential ? "row-essential" : ""}">
-        <td><span class="badge">${escapeHtml(r.kind)}</span></td>
+        <td>${reactionTypeBadge(r.kind)}</td>
         <td><strong>${escapeHtml(r.id)}</strong></td>
         <td class="wrap">${escapeHtml(r.name || "—")}</td>
         <td>${escapeHtml(r.metabolite_name || r.metabolite_id || "—")} <span class="stoich">${escapeHtml(r.metabolite_id || "")}</span></td>
@@ -1059,9 +1439,7 @@ function renderDemandSinkAuditTable(rows) {
       </tr>`).join("")}</tbody>
     </table></div>
   `;
-  $("dsAuditExportBtn").addEventListener("click", () =>
-    exportTableToCsv("demand_sink_audit.csv", DSAUDIT_CSV_COLUMNS, rows)
-  );
+  attachTableTools("dsAuditTable", $("dsAuditResults").querySelector(".toolbar"), DSAUDIT_TABLE_COLUMNS, () => dsAuditCurrentRows, "demand_sink_audit", DSAUDIT_CSV_COLUMNS);
 }
 
 // ---------------------------------------------------------------------------
@@ -2068,48 +2446,55 @@ function renderFrogResults(data) {
   });
 }
 
+let frogFvaCurrentRows = [];
+let frogRxnDelCurrentRows = [];
+let frogGeneDelCurrentRows = [];
+
 function renderFrogFvaTable(rows) {
   const wrap = $("frogFvaWrap");
+  frogFvaCurrentRows = rows || [];
   if (!rows) { wrap.innerHTML = `<div class="note">Not computed (unchecked before running).</div>`; return; }
   if (!rows.length) { wrap.innerHTML = `<div class="note">No reactions.</div>`; return; }
   wrap.innerHTML = `
-    <div class="toolbar"><button id="frogFvaExportBtn" type="button">Export table to CSV</button></div>
+    <div class="toolbar"></div>
     <div class="table-wrap"><table id="frogFvaTable">
       <thead><tr><th data-key="id">Reaction ID</th><th data-key="minimum">Minimum flux</th><th data-key="maximum">Maximum flux</th></tr></thead>
       <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.minimum, 6)}</td><td class="num">${fmt(r.maximum, 6)}</td></tr>`).join("")}</tbody>
     </table></div>
   `;
-  $("frogFvaExportBtn").addEventListener("click", () => exportTableToCsv("frog_fva.csv", FROG_FVA_CSV_COLUMNS, rows));
+  attachTableTools("frogFvaTable", wrap.querySelector(".toolbar"), FROG_FVA_CSV_COLUMNS, () => frogFvaCurrentRows, "frog_fva");
   setTimeout(() => makeSortable("frogFvaTable", rows, renderFrogFvaTable), 0);
 }
 
 function renderFrogReactionDeletionTable(rows) {
   const wrap = $("frogRxnDelWrap");
+  frogRxnDelCurrentRows = rows || [];
   if (!rows) { wrap.innerHTML = `<div class="note">Not computed (unchecked before running).</div>`; return; }
   if (!rows.length) { wrap.innerHTML = `<div class="note">No reactions.</div>`; return; }
   wrap.innerHTML = `
-    <div class="toolbar"><button id="frogRxnDelExportBtn" type="button">Export table to CSV</button></div>
+    <div class="toolbar"></div>
     <div class="table-wrap"><table id="frogRxnDelTable">
       <thead><tr><th data-key="id">Reaction ID</th><th data-key="growth">Growth after knockout</th><th data-key="status">Status</th></tr></thead>
       <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.growth, 6)}</td><td>${escapeHtml(r.status)}</td></tr>`).join("")}</tbody>
     </table></div>
   `;
-  $("frogRxnDelExportBtn").addEventListener("click", () => exportTableToCsv("frog_reaction_deletions.csv", FROG_REACTION_DELETION_CSV_COLUMNS, rows));
+  attachTableTools("frogRxnDelTable", wrap.querySelector(".toolbar"), FROG_REACTION_DELETION_CSV_COLUMNS, () => frogRxnDelCurrentRows, "frog_reaction_deletions");
   setTimeout(() => makeSortable("frogRxnDelTable", rows, renderFrogReactionDeletionTable), 0);
 }
 
 function renderFrogGeneDeletionTable(rows) {
   const wrap = $("frogGeneDelWrap");
+  frogGeneDelCurrentRows = rows || [];
   if (!rows) { wrap.innerHTML = `<div class="note">Not computed (unchecked before running).</div>`; return; }
   if (!rows.length) { wrap.innerHTML = `<div class="note">No genes.</div>`; return; }
   wrap.innerHTML = `
-    <div class="toolbar"><button id="frogGeneDelExportBtn" type="button">Export table to CSV</button></div>
+    <div class="toolbar"></div>
     <div class="table-wrap"><table id="frogGeneDelTable">
       <thead><tr><th data-key="id">Gene ID</th><th data-key="growth">Growth after knockout</th><th data-key="status">Status</th></tr></thead>
       <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.growth, 6)}</td><td>${escapeHtml(r.status)}</td></tr>`).join("")}</tbody>
     </table></div>
   `;
-  $("frogGeneDelExportBtn").addEventListener("click", () => exportTableToCsv("frog_gene_deletions.csv", FROG_GENE_DELETION_CSV_COLUMNS, rows));
+  attachTableTools("frogGeneDelTable", wrap.querySelector(".toolbar"), FROG_GENE_DELETION_CSV_COLUMNS, () => frogGeneDelCurrentRows, "frog_gene_deletions");
   setTimeout(() => makeSortable("frogGeneDelTable", rows, renderFrogGeneDeletionTable), 0);
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import io
 import json
 import math
@@ -104,8 +105,8 @@ TRIVIAL_METABOLITES = {
     "itp", "idp", "imp",
     "nad", "nadh", "nadp", "nadph",
     "fad", "fadh2",
-    "coa", "co_a", 
-    "co2", 
+    "coa", "co_a",
+    "co2",
     "q8", "q8h2", "mqn8", "mql8",
 }
 
@@ -233,6 +234,227 @@ def clean_metabolite_display_name(met):
             return cleaned
     return name
 
+def clean_reaction_display_name(rxn):
+    """Reaction display name with an embedded compartment tag stripped —
+    the reaction-side counterpart of clean_metabolite_display_name above,
+    for exports that bake a compartment into the reaction *name* itself
+    (e.g. name="ATP synthase, mitochondrial [m]"). The reaction *id* is
+    left completely untouched everywhere in this app — only the
+    human-readable name is cleaned here.
+    """
+    name = (rxn.name or rxn.id or "").strip()
+    if not name:
+        return name
+
+    match = _COMPARTMENT_SUFFIX_RE.search(name)
+    if not match:
+        return name
+
+    is_bracket_or_paren = match.group(3) is not None or match.group(5) is not None
+    code = next((g for g in (match.group(1), match.group(3), match.group(5)) if g), "").lower()
+
+    own_compartment_bases = set()
+    for met in rxn.metabolites:
+        comp = getattr(met, "compartment", None)
+        if comp:
+            comp_match = re.match(r"^([A-Za-z]+)\d*$", comp)
+            own_compartment_bases.add((comp_match.group(1) if comp_match else comp).lower())
+
+    if is_bracket_or_paren or code in own_compartment_bases or code in COMPARTMENT_NAME_MAP:
+        cleaned = name[: match.start()].rstrip(" _-")
+        if cleaned:
+            return cleaned
+    return name
+
+# ---------------------------------------------------------------------------
+# Namespace detection + MetaNetX (MNX) id mapping.
+#
+# On "Analyze model", before anything else is shown, we work out (a) which
+# id namespace the uploaded model's metabolites/reactions use (BiGG, VMH,
+# SEED, KEGG, MetaCyc, ...) and (b) which compartment-suffix convention it
+# uses (_c, [c], _C0, (c), ...), then map every metabolite/reaction id to a
+# MetaNetX id using a bundled, filtered copy of MetaNetX's own chem_xref /
+# reac_xref cross-reference tables (data/chem_xref.tsv.gz, data/reac_xref.tsv.gz
+# — 3 columns: namespace, id-in-that-namespace, mnx-id). Namespace detection
+# is itself data-driven off these same tables (rather than hand-written regex
+# heuristics per vendor): whichever namespace's id set matches the most ids
+# in this model is the detected namespace.
+# ---------------------------------------------------------------------------
+
+CHEM_NAMESPACES = [
+    "bigg.metabolite", "biggM",
+    "vmhmetabolite", "vmhM",
+    "seed.compound", "seedM",
+    "kegg.compound",
+    "metacyc.compound", "metacycM",
+]
+REAC_NAMESPACES = [
+    "bigg.reaction", "biggR",
+    "vmhreaction", "vmhR",
+    "seed.reaction", "seedR",
+    "kegg.reaction",
+    "metacyc.reaction", "metacycR",
+]
+NS_LABELS = {
+    "bigg.metabolite": "BiGG", "biggM": "BiGG (legacy M_-prefixed)",
+    "vmhmetabolite": "VMH", "vmhM": "VMH (legacy M_-prefixed)",
+    "seed.compound": "ModelSEED", "seedM": "ModelSEED (legacy M_-prefixed)",
+    "kegg.compound": "KEGG",
+    "metacyc.compound": "MetaCyc", "metacycM": "MetaCyc (legacy M_-prefixed)",
+    "bigg.reaction": "BiGG", "biggR": "BiGG (legacy R_-prefixed)",
+    "vmhreaction": "VMH", "vmhR": "VMH (legacy R_-prefixed)",
+    "seed.reaction": "ModelSEED", "seedR": "ModelSEED (legacy R_-prefixed)",
+    "kegg.reaction": "KEGG",
+    "metacyc.reaction": "MetaCyc", "metacycR": "MetaCyc (legacy R_-prefixed)",
+}
+
+_MNX_DATA_DIR = Path(__file__).parent / "data"
+_xref_cache = {"chem": None, "reac": None}
+
+def _load_xref(kind):
+    """Lazily load+cache the bundled MetaNetX xref table for "chem" or
+    "reac" into {namespace: {id: mnx_id}}. Loaded once per process, on
+    first use, and kept in memory for the life of the server."""
+    if _xref_cache[kind] is not None:
+        return _xref_cache[kind]
+    fname = "chem_xref.tsv.gz" if kind == "chem" else "reac_xref.tsv.gz"
+    path = _MNX_DATA_DIR / fname
+    xref = {}
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 3:
+                    continue
+                ns, ident, mnx_id = parts
+                xref.setdefault(ns, {})[ident] = mnx_id
+    except FileNotFoundError:
+        xref = {}
+    _xref_cache[kind] = xref
+    return xref
+
+def metabolite_base_id_preserve_case(met_id):
+    """Like metabolite_base_id, but keeps the original casing — needed for
+    MetaNetX lookups, since e.g. KEGG ("C00031") and MetaCyc ids are
+    case-sensitive and metabolite_base_id() lowercases for the trivial-
+    metabolite check."""
+    base, _ = parse_compartment_suffix(met_id)
+    return base
+
+def detect_namespace_and_map(id_pairs, xref, ns_list):
+    """id_pairs: list of (original_id, lookup_key) tuples. xref: the loaded
+    {namespace: {id: mnx_id}} table. ns_list: namespaces to consider, most
+    specific first.
+
+    Finds whichever namespace's id set matches the most lookup_keys in this
+    model (the model's detected/dominant namespace), then builds a full
+    original_id -> mnx_id map for every id, trying that namespace first and
+    falling back to any other known namespace per-id (handles models that
+    mix conventions, or a handful of ids the dominant namespace misses).
+
+    Returns (detected_namespace_or_None, coverage_fraction, example_original_id_or_None, {original_id: mnx_id_or_None}).
+    """
+    total = len(id_pairs)
+    if total == 0:
+        return None, 0.0, None, {}
+
+    best_ns, best_count, best_example = None, 0, None
+    for ns in ns_list:
+        idset = xref.get(ns)
+        if not idset:
+            continue
+        count = 0
+        example = None
+        for orig, key in id_pairs:
+            if key in idset:
+                count += 1
+                if example is None:
+                    example = orig
+        if count > best_count:
+            best_ns, best_count, best_example = ns, count, example
+
+    coverage = (best_count / total) if total else 0.0
+
+    id_to_mnx = {}
+    primary_map = xref.get(best_ns, {}) if best_ns else {}
+    fallback_namespaces = [ns for ns in ns_list if ns != best_ns]
+    for orig, key in id_pairs:
+        mnx = primary_map.get(key)
+        if mnx is None:
+            for ns in fallback_namespaces:
+                mnx = xref.get(ns, {}).get(key)
+                if mnx is not None:
+                    break
+        id_to_mnx[orig] = mnx
+    return best_ns, coverage, best_example, id_to_mnx
+
+def detect_metabolite_namespace_and_map(model):
+    id_pairs = [(met.id, metabolite_base_id_preserve_case(met.id)) for met in model.metabolites]
+    return detect_namespace_and_map(id_pairs, _load_xref("chem"), CHEM_NAMESPACES)
+
+def detect_reaction_namespace_and_map(model):
+    # Reaction ids keep their compartment tag as part of the id itself
+    # (e.g. "EX_glc__D_e"), so — unlike metabolites — they're looked up
+    # as-is, with no compartment-suffix stripping.
+    id_pairs = [(rxn.id, rxn.id) for rxn in model.reactions]
+    return detect_namespace_and_map(id_pairs, _load_xref("reac"), REAC_NAMESPACES)
+
+_COMPARTMENT_STYLE_LABELS = {
+    "underscore": "Underscore suffix (e.g. _c)",
+    "underscore_indexed": "Underscore suffix with numeric index (e.g. _c0)",
+    "bracket": "Bracketed suffix (e.g. [c])",
+    "bracket_indexed": "Bracketed suffix with numeric index (e.g. [c0])",
+    "paren": "Parenthesized suffix (e.g. (c))",
+    "paren_indexed": "Parenthesized suffix with numeric index (e.g. (c0))",
+}
+
+def detect_compartment_convention(model):
+    """Scan every metabolite id for its trailing compartment tag (reusing
+    _COMPARTMENT_SUFFIX_RE) and report whichever tagging convention is
+    dominant across the model, with a real example."""
+    style_counts = {}
+    example_by_style = {}
+    for met in model.metabolites:
+        mid = met.id
+        match = _COMPARTMENT_SUFFIX_RE.search(mid)
+        if not match:
+            continue
+        if match.group(1) is not None:
+            code, idx = match.group(1), match.group(2)
+            style = "underscore_indexed" if idx else "underscore"
+            suffix = f"_{code}{idx}"
+        elif match.group(3) is not None:
+            code, idx = match.group(3), match.group(4)
+            style = "bracket_indexed" if idx else "bracket"
+            suffix = f"[{code}{idx}]"
+        else:
+            code, idx = match.group(5), match.group(6)
+            style = "paren_indexed" if idx else "paren"
+            suffix = f"({code}{idx})"
+        style_counts[style] = style_counts.get(style, 0) + 1
+        if style not in example_by_style:
+            example_by_style[style] = {"id": mid, "suffix": suffix}
+
+    if not style_counts:
+        return {
+            "style": None,
+            "label": "No compartment suffix detected on metabolite ids",
+            "example": None,
+            "suffix": None,
+            "coverage": 0.0,
+        }
+
+    best_style = max(style_counts, key=style_counts.get)
+    total = len(model.metabolites)
+    ex = example_by_style[best_style]
+    return {
+        "style": best_style,
+        "label": _COMPARTMENT_STYLE_LABELS.get(best_style, best_style),
+        "example": ex["id"],
+        "suffix": ex["suffix"],
+        "coverage": (style_counts[best_style] / total) if total else 0.0,
+    }
+
 def classify_reactions(model):
     """Classify every reaction once and return {reaction_id: type}.
 
@@ -288,6 +510,49 @@ def load_uploaded_model(path: Path):
     # SBML reader supports .gz/.zip/.bz2 when libSBML was built accordingly.
     return read_sbml_model(str(path))
 
+def compute_metabolite_reaction_stats(model):
+    """For every metabolite, count its reaction roles.
+
+    Categories are mutually exclusive:
+      - produced_count: irreversible reactions where metabolite has
+        a positive stoichiometric coefficient
+      - consumed_count: irreversible reactions where metabolite has
+        a negative stoichiometric coefficient
+      - reversible_count: reactions that can carry flux in both directions
+
+    Thus:
+        reaction_count = produced_count + consumed_count + reversible_count
+
+    Reversible reactions are not classified as produced/consumed here.
+    Their actual role depends on the flux direction and should be
+    determined separately when flux information is available.
+
+    Returns {met_id: {"reaction_count", "produced_count", "consumed_count", "reversible_count"}}.    
+    """
+    stats = {}
+
+    for rxn in model.reactions:
+        reversible = rxn.lower_bound < 0 and rxn.upper_bound > 0
+
+        for met, coeff in rxn.metabolites.items():
+            entry = stats.setdefault(met.id, {
+                "reaction_count": 0,
+                "produced_count": 0,
+                "consumed_count": 0,
+                "reversible_count": 0,
+            })
+
+            entry["reaction_count"] += 1
+
+            if reversible:
+                entry["reversible_count"] += 1
+            elif coeff > 0:
+                entry["produced_count"] += 1
+            elif coeff < 0:
+                entry["consumed_count"] += 1
+
+    return stats
+
 def quick_analyze(model):
     """Fast initial analysis without KO tests."""
     wt_solution = model.optimize()
@@ -296,6 +561,14 @@ def quick_analyze(model):
 
     if wt_growth is None:
         wt_growth = 0.0
+
+    # Namespace detection + MetaNetX mapping, done once up front so both the
+    # Overview stats and the per-row metabolite/reaction tables below can use
+    # the results. See "Namespace detection + MetaNetX (MNX) id mapping"
+    # above for how this works.
+    met_ns, met_ns_coverage, met_ns_example, met_to_mnx = detect_metabolite_namespace_and_map(model)
+    rxn_ns, rxn_ns_coverage, rxn_ns_example, rxn_to_mnx = detect_reaction_namespace_and_map(model)
+    compartment_convention = detect_compartment_convention(model)
 
     # Basic statistics
     stats = {
@@ -313,16 +586,46 @@ def quick_analyze(model):
         "objective_direction": str(model.objective.direction),
         "wt_status": wt_status,
         "wt_growth": wt_growth,
+        "namespace_metabolites": {
+            "key": met_ns,
+            "label": NS_LABELS.get(met_ns, met_ns) if met_ns else "Unrecognized (not in bundled BiGG/VMH/SEED/KEGG/MetaCyc reference)",
+            "example": met_ns_example,
+            "coverage": met_ns_coverage,
+        },
+        "namespace_reactions": {
+            "key": rxn_ns,
+            "label": NS_LABELS.get(rxn_ns, rxn_ns) if rxn_ns else "Unrecognized (not in bundled BiGG/VMH/SEED/KEGG/MetaCyc reference)",
+            "example": rxn_ns_example,
+            "coverage": rxn_ns_coverage,
+        },
+        "compartment_convention": compartment_convention,
     }
 
     # Precompute metabolite -> single-metabolite exchange lookup once, instead
     # of scanning every exchange (and rebuilding a metabolite-id list on every
     # scan) for each objective metabolite below.
+    #
+    # This is keyed by the metabolite's compartment-stripped *base* id (e.g.
+    # "pyr", not "pyr_c"), not the raw id. A biomass-reaction metabolite is
+    # essentially always intracellular (e.g. "pyr_c"), while an exchange
+    # reaction is essentially always on the *extracellular* form of the same
+    # compound (e.g. "pyr_e") -- so keying this map by the exact met.id (the
+    # previous behavior) meant it could never match anything for a real
+    # biomass reaction and "direct_exchange" was always None. Matching by
+    # base id instead answers the actually-useful question: "does this
+    # biomass building block have a same-compound exchange reaction
+    # somewhere in the model (typically in the extracellular compartment)?"
     direct_exchange_by_met = {}
     for exch in model.exchanges:
         if len(exch.metabolites) == 1:
             (met,) = exch.metabolites.keys()
-            direct_exchange_by_met.setdefault(met.id, exch.id)
+            direct_exchange_by_met.setdefault(metabolite_base_id(met.id), exch.id)
+
+    # Per-metabolite reaction-role stats (how many reactions each metabolite
+    # appears in / is produced in / is consumed in / reversible), shared by
+    # both the main Metabolites table and the Objective tab below.
+    met_reaction_stats = compute_metabolite_reaction_stats(model)
+    _empty_met_stats = {"reaction_count": 0, "produced_count": 0, "consumed_count": 0, "reversible_count": 0}
 
     # Objective components
     objective_components = []
@@ -360,13 +663,25 @@ def quick_analyze(model):
         
         for met_id, met_info in sorted(met_coeff_map.items()):
             met = met_info["met"]
+            total_coeff = safe_float(met_info["total_coeff"])
+            m_stats = met_reaction_stats.get(met.id, _empty_met_stats)
             objective_metabolites.append({
                 "metabolite_id": met.id,
+                "metabolite_metanetx_id": met_to_mnx.get(met.id),
                 "metabolite_name": clean_metabolite_display_name(met),
                 "compartment": met.compartment,
-                "coefficient": safe_float(met_info["total_coeff"]),
-                "direct_exchange": direct_exchange_by_met.get(met.id),
+                "coefficient": total_coeff,
+                # Net role of this metabolite in the objective/biomass
+                # reaction(s) specifically -- not to be confused with
+                # produced_count/consumed_count below, which count *all*
+                # reactions in the model this metabolite appears in.
+                "biomass_role": "produced" if (total_coeff or 0) > 0 else ("consumed" if (total_coeff or 0) < 0 else "neutral"),
+                "direct_exchange": direct_exchange_by_met.get(metabolite_base_id(met.id)),
                 "appears_in_reactions": met_info["rxn_count"],
+                "reaction_count": m_stats["reaction_count"],
+                "produced_count": m_stats["produced_count"],
+                "consumed_count": m_stats["consumed_count"],
+                "reversible_count": m_stats["reversible_count"],
             })
     except Exception as exc:
         objective_components = [{
@@ -381,7 +696,8 @@ def quick_analyze(model):
         flux = safe_float(fluxes.get(rxn.id)) if hasattr(fluxes, "get") else None
         reactions.append({
             "id": rxn.id,
-            "name": rxn.name,
+            "metanetx_id": rxn_to_mnx.get(rxn.id),
+            "name": clean_reaction_display_name(rxn),
             "type": reaction_types.get(rxn.id, "internal"),
             "subsystem": subsystem_value(rxn),
             "compartments": sorted({m.compartment for m in rxn.metabolites if m.compartment}),
@@ -395,12 +711,18 @@ def quick_analyze(model):
     # Metabolite table
     metabolites = []
     for met in model.metabolites:
+        m_stats = met_reaction_stats.get(met.id, _empty_met_stats)
         metabolites.append({
             "id": met.id,
+            "metanetx_id": met_to_mnx.get(met.id),
             "name": clean_metabolite_display_name(met),
             "compartment": met.compartment,
             "formula": getattr(met, "formula", None),
             "charge": clean(getattr(met, "charge", None)),
+            "reaction_count": m_stats["reaction_count"],
+            "produced_count": m_stats["produced_count"],
+            "consumed_count": m_stats["consumed_count"],
+            "reversible_count": m_stats["reversible_count"],
         })
 
     return {
