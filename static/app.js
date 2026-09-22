@@ -609,6 +609,20 @@ function renderReactions() {
       <input id="rxnSearch" type="text" placeholder="Search ID, name, subsystem…">
       <select id="rxnType"><option value="">All types</option>${types.map(t => `<option>${escapeHtml(t)}</option>`).join("")}</select>
       <select id="rxnSubsystem"><option value="">All subsystems</option>${subsystems(DATA.reactions).map(t => `<option>${escapeHtml(t)}</option>`).join("")}</select>
+      <select id="rxnMapped">
+        <option value="">MetaNetX: all</option>
+        <option value="mapped">MetaNetX: mapped only</option>
+        <option value="unmapped">MetaNetX: unmapped only</option>
+      </select>
+      <select id="rxnGpr">
+        <option value="">GPR: all</option>
+        <option value="has">GPR: has a rule</option>
+        <option value="none">GPR: no rule</option>
+      </select>
+      <select id="rxnComp">
+        <option value="">All compartments</option>
+        ${[...new Set(DATA.reactions.flatMap(r => r.compartments || []))].sort().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(COMP_NAMES[c] || c)}</option>`).join("")}
+      </select>
       <span id="rxnCount"></span>
     </div>
     <div class="table-wrap"><table id="rxnTable">
@@ -629,9 +643,15 @@ function renderReactions() {
     const q = $("rxnSearch").value.toLowerCase();
     const type = $("rxnType").value;
     const sub = $("rxnSubsystem").value;
+    const mapped = $("rxnMapped").value;
+    const gpr = $("rxnGpr").value;
+    const comp = $("rxnComp").value;
     const rows = filtered ? filtered : DATA.reactions.filter(r =>
       (!q || `${r.id} ${r.metanetx_id || ""} ${r.name} ${r.subsystem} ${r.gene_reaction_rule}`.toLowerCase().includes(q)) &&
-      (!type || r.type === type) && (!sub || r.subsystem === sub)
+      (!type || r.type === type) && (!sub || r.subsystem === sub) &&
+      (!mapped || (mapped === "mapped" ? !!r.metanetx_id : !r.metanetx_id)) &&
+      (!gpr || (gpr === "has" ? !!(r.gene_reaction_rule || "").trim() : !(r.gene_reaction_rule || "").trim())) &&
+      (!comp || (r.compartments || []).includes(comp))
     );
     rxnCurrentRows = rows;
     $("rxnCount").textContent = `${rows.length} / ${DATA.reactions.length}`;
@@ -645,7 +665,7 @@ function renderReactions() {
       <td class="num">${fmt(r.wt_flux)}</td>
     </tr>`).join("");
   };
-  ["rxnSearch","rxnType","rxnSubsystem"].forEach(id => $(id).addEventListener("input", () => redraw()));
+  ["rxnSearch","rxnType","rxnSubsystem","rxnMapped","rxnGpr","rxnComp"].forEach(id => $(id).addEventListener("input", () => redraw()));
   redraw();
   setTimeout(() => makeSortable("rxnTable", DATA.reactions, redraw), 0);
   attachTableTools("rxnTable", $("reactions").querySelector(".toolbar"), REACTION_TABLE_COLUMNS, () => rxnCurrentRows, "reactions");
