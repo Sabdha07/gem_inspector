@@ -16,6 +16,9 @@ import uuid
 from pathlib import Path
 from collections import deque
 
+import numpy as np
+import scipy.sparse as sp
+
 from flask import Flask, jsonify, render_template, request, Response
 from werkzeug.utils import secure_filename
 
@@ -399,6 +402,105 @@ def detect_reaction_namespace_and_map(model):
     id_pairs = [(rxn.id, rxn.id) for rxn in model.reactions]
     return detect_namespace_and_map(id_pairs, _load_xref("reac"), REAC_NAMESPACES)
 
+def _normalize_name_for_match(name):
+    """Loosely normalize a metabolite/reaction display name for same-model
+    name matching: lowercase, collapse anything that isn't a letter/digit
+    into a single space.
+
+    Used only to compare names WITHIN a single uploaded model. The bundled
+    MetaNetX cross-reference files (chem_xref.tsv.gz / reac_xref.tsv.gz)
+    are id <-> id tables only -- they carry no chemical or reaction names --
+    so there is no external name database to check an unmapped id against.
+    The next best thing is checking whether the SAME name already appears
+    on a different, already-mapped id elsewhere in this model: that's the
+    signature of a namespace mix-up (e.g. a couple of VMH-style metabolite
+    ids added into an otherwise-BiGG model under different ids than the
+    rest of the model would have used for the same compound).
+    """
+    if not name:
+        return None
+    n = re.sub(r"[^a-z0-9]+", " ", name.strip().lower()).strip()
+    return n or None
+
+def compute_unmapped_id_audit(model, met_to_mnx, rxn_to_mnx):
+    """Find metabolites/reactions that didn't map to any MetaNetX id under
+    any of the bundled namespaces, and for each one, look for other ids in
+    THIS model that share its (normalized) display name and DID map. See
+    _normalize_name_for_match for why this is a same-model check rather
+    than a lookup against an external name table.
+
+    Returns a dict with per-kind lists of unmapped entries (each carrying
+    any same-name "likely_duplicate_of" candidates found elsewhere in the
+    model) plus mapped/unmapped counts.
+    """
+    met_name_index = {}
+    for met in model.metabolites:
+        norm = _normalize_name_for_match(clean_metabolite_display_name(met))
+        if norm:
+            met_name_index.setdefault(norm, []).append(met.id)
+
+    unmapped_metabolites = []
+    mapped_metabolite_count = 0
+    for met in model.metabolites:
+        mnx = met_to_mnx.get(met.id)
+        if mnx:
+            mapped_metabolite_count += 1
+            continue
+        name = clean_metabolite_display_name(met)
+        norm = _normalize_name_for_match(name)
+        candidates = []
+        if norm:
+            for other_id in met_name_index.get(norm, []):
+                if other_id == met.id:
+                    continue
+                other_mnx = met_to_mnx.get(other_id)
+                if other_mnx:
+                    candidates.append({"id": other_id, "metanetx_id": other_mnx})
+        unmapped_metabolites.append({
+            "id": met.id,
+            "name": name,
+            "compartment": met.compartment,
+            "likely_duplicate_of": candidates,
+        })
+
+    rxn_name_index = {}
+    for rxn in model.reactions:
+        norm = _normalize_name_for_match(clean_reaction_display_name(rxn))
+        if norm:
+            rxn_name_index.setdefault(norm, []).append(rxn.id)
+
+    unmapped_reactions = []
+    mapped_reaction_count = 0
+    for rxn in model.reactions:
+        mnx = rxn_to_mnx.get(rxn.id)
+        if mnx:
+            mapped_reaction_count += 1
+            continue
+        name = clean_reaction_display_name(rxn)
+        norm = _normalize_name_for_match(name)
+        candidates = []
+        if norm:
+            for other_id in rxn_name_index.get(norm, []):
+                if other_id == rxn.id:
+                    continue
+                other_mnx = rxn_to_mnx.get(other_id)
+                if other_mnx:
+                    candidates.append({"id": other_id, "metanetx_id": other_mnx})
+        unmapped_reactions.append({
+            "id": rxn.id,
+            "name": name,
+            "likely_duplicate_of": candidates,
+        })
+
+    return {
+        "unmapped_metabolites": unmapped_metabolites,
+        "unmapped_reactions": unmapped_reactions,
+        "unmapped_metabolite_count": len(unmapped_metabolites),
+        "mapped_metabolite_count": mapped_metabolite_count,
+        "unmapped_reaction_count": len(unmapped_reactions),
+        "mapped_reaction_count": mapped_reaction_count,
+    }
+
 _COMPARTMENT_STYLE_LABELS = {
     "underscore": "Underscore suffix (e.g. _c)",
     "underscore_indexed": "Underscore suffix with numeric index (e.g. _c0)",
@@ -527,7 +629,7 @@ def compute_metabolite_reaction_stats(model):
     Their actual role depends on the flux direction and should be
     determined separately when flux information is available.
 
-    Returns {met_id: {"reaction_count", "produced_count", "consumed_count", "reversible_count"}}.    
+    Returns {met_id: {"reaction_count", "produced_count", "consumed_count", "reversible_count"}}.
     """
     stats = {}
 
@@ -570,6 +672,15 @@ def quick_analyze(model):
     rxn_ns, rxn_ns_coverage, rxn_ns_example, rxn_to_mnx = detect_reaction_namespace_and_map(model)
     compartment_convention = detect_compartment_convention(model)
 
+    # Which metabolites/reactions never matched any bundled MetaNetX
+    # namespace, plus a same-model, same-name check for each one (see
+    # compute_unmapped_id_audit for why this can't be a lookup against an
+    # external name table).
+    namespace_audit = compute_unmapped_id_audit(model, met_to_mnx, rxn_to_mnx)
+
+    n_genes = len(model.genes)
+    n_reactions = len(model.reactions)
+
     # Basic statistics
     stats = {
         "model_id": model.id,
@@ -599,6 +710,12 @@ def quick_analyze(model):
             "coverage": rxn_ns_coverage,
         },
         "compartment_convention": compartment_convention,
+        "gene_reaction_ratio": (n_genes / n_reactions) if n_reactions else None,
+        "reaction_gene_ratio": (n_reactions / n_genes) if n_genes else None,
+        "unmapped_metabolite_count": namespace_audit["unmapped_metabolite_count"],
+        "mapped_metabolite_count": namespace_audit["mapped_metabolite_count"],
+        "unmapped_reaction_count": namespace_audit["unmapped_reaction_count"],
+        "mapped_reaction_count": namespace_audit["mapped_reaction_count"],
     }
 
     # Precompute metabolite -> single-metabolite exchange lookup once, instead
@@ -643,23 +760,28 @@ def quick_analyze(model):
         met_coeff_map = {}
 
         for rxn, coeff in coefficients.items():
+            try:
+                reaction_string_names = rxn.build_reaction_string(use_metabolite_names=True)
+            except Exception:
+                reaction_string_names = None
             objective_components.append({
                 "reaction_id": rxn.id,
                 "reaction_name": rxn.name,
                 "coefficient": safe_float(coeff),
                 "reaction": rxn.reaction,
+                "reaction_string_names": reaction_string_names,
                 "subsystem": subsystem_value(rxn),
                 "reactants": stoich_rows(rxn),
                 "products": stoich_rows(rxn),
             })
             
             for met, met_coeff in rxn.metabolites.items():
-                if not is_trivial_metabolite(met):
-                    key = met.id
-                    if key not in met_coeff_map:
-                        met_coeff_map[key] = {"met": met, "total_coeff": 0.0, "rxn_count": 0}
-                    met_coeff_map[key]["total_coeff"] += safe_float(met_coeff) * coeff if coeff else 0
-                    met_coeff_map[key]["rxn_count"] += 1
+                #if not is_trivial_metabolite(met):
+                key = met.id
+                if key not in met_coeff_map:
+                    met_coeff_map[key] = {"met": met, "total_coeff": 0.0, "rxn_count": 0}
+                met_coeff_map[key]["total_coeff"] += safe_float(met_coeff) * coeff if coeff else 0
+                met_coeff_map[key]["rxn_count"] += 1
         
         for met_id, met_info in sorted(met_coeff_map.items()):
             met = met_info["met"]
@@ -731,6 +853,7 @@ def quick_analyze(model):
         "metabolites": metabolites,
         "objective": objective_components,
         "objective_metabolites": objective_metabolites,
+        "namespace_audit": namespace_audit,
         "wt_growth": wt_growth,
         "fluxes": dict(fluxes),
         "essentiality_rule": "Exchange reaction is essential when reaction KO gives growth < 5% of WT growth.",
@@ -741,7 +864,9 @@ def stream_ko_analysis(model, wt_growth, fluxes):
     """Generator that yields KO results with progress updates."""
     exchanges = list(model.exchanges)
     total = len(exchanges)
-    
+    _, _, _, met_to_mnx = detect_metabolite_namespace_and_map(model)
+    _, _, _, rxn_to_mnx = detect_reaction_namespace_and_map(model)
+
     yield "data: " + json.dumps({"type": "info", "message": f"Starting KO analysis for {total} exchanges..."}) + "\n\n"
     
     essentiality = []
@@ -784,11 +909,14 @@ def stream_ko_analysis(model, wt_growth, fluxes):
 
         met_ids = [m.id for m in rxn.metabolites]
         met_names = [clean_metabolite_display_name(m) for m in rxn.metabolites]
+        met_metanetx_ids = [met_to_mnx.get(m.id) for m in rxn.metabolites]
 
         essentiality.append({
             "id": rxn.id,
+            "metanetx_id": rxn_to_mnx.get(rxn.id),
             "name": rxn.name,
             "metabolites": met_ids,
+            "metabolite_metanetx_ids": met_metanetx_ids,
             "metabolite_names": met_names,
             "lower_bound": safe_float(rxn.lower_bound),
             "upper_bound": safe_float(rxn.upper_bound),
@@ -1124,6 +1252,9 @@ def compute_minimal_medium_report(model, growth_cutoff_fraction=1.0, minimize_co
             "wt_growth": wt_growth,
         }
 
+    _, _, _, met_to_mnx = detect_metabolite_namespace_and_map(model)
+    _, _, _, rxn_to_mnx = detect_reaction_namespace_and_map(model)
+
     try:
         growth_cutoff_fraction = float(growth_cutoff_fraction)
     except (TypeError, ValueError):
@@ -1158,8 +1289,10 @@ def compute_minimal_medium_report(model, growth_cutoff_fraction=1.0, minimize_co
         met = next(iter(rxn.metabolites.keys()), None)
         components.append({
             "exchange_id": rxn_id,
+            "exchange_metanetx_id": rxn_to_mnx.get(rxn_id),
             "exchange_name": rxn.name,
             "metabolite_id": met.id if met else None,
+            "metabolite_metanetx_id": met_to_mnx.get(met.id) if met else None,
             "metabolite_name": clean_metabolite_display_name(met) if met else None,
             "uptake_flux": abs(safe_float(flux) or 0.0),
         })
@@ -1555,140 +1688,362 @@ def apply_knockouts(model, resolved_targets):
 # ---------------------------------------------------------------------------
 # Network Gaps tab (on-request, as soon as the model loads).
 #
-# Two complementary diagnostics for spotting network-connectivity gaps
-# (dead-end/orphan metabolites, un-fillable pathways) under the model's
-# CURRENT bounds -- i.e. whatever diet was applied at upload time, exactly
-# as everything else in the app sees it:
-#   - Blocked reactions: reactions that cannot carry any flux at all, via
-#     cobra's own FVA-based find_blocked_reactions. open_exchanges is left
-#     False (unlike minimal_medium) so this uses the model's real current
-#     bounds rather than an artificially widened, poorly-scaled problem --
-#     the kind of thing that has been observed to destabilize GLPK on some
-#     builds (see run_with_exact_solver above). processes is pinned to 1:
-#     cobra's default parallel FVA spawns worker processes, and on Windows
-#     that uses the "spawn" start method, which re-pickles the model into a
-#     fresh interpreter for each worker -- fragile and slow to do from
-#     inside a live Flask request, so a single serial pass is used instead.
-#   - Dead-end metabolites: a fast, local, purely structural check (no LP
-#     solves at all) for metabolites that, given each of their reactions'
-#     current bounds/reversibility, can only ever be produced or only ever
-#     be consumed -- never both. That's often *why* a reaction ends up
-#     blocked, though a reaction can also be blocked for more global
-#     network reasons a local per-metabolite check can't see, which is why
-#     both diagnostics are shown together rather than one substituting for
-#     the other.
+# Two INDEPENDENT diagnostics:
+#
+#   1. Blocked reactions:
+#      COBRApy FVA-based find_blocked_reactions().
+#      A reaction is blocked if it cannot carry flux under the model's
+#      current bounds.
+#
+#   2. Dead-end metabolites:
+#      Independent stoichiometric check using reaction stoichiometry and
+#      current reaction directionality. NO FVA results are used here.
+#      A metabolite is a dead end if it cannot both be produced and consumed.
+#
+# The two diagnostics are intentionally kept separate:
+#   - blocked reactions = LP/FVA-based
+#   - dead-end metabolites = stoichiometry + reaction bounds only
 # ---------------------------------------------------------------------------
 
-def find_dead_end_metabolites(model):
-    """Bounds-aware structural dead-end check (see module comment above).
-    Returns a list of {"id", "reason", "reactions"} for every metabolite
-    that can only ever be produced, only ever be consumed, or never either
-    (reason: "no_consuming_reaction", "no_producing_reaction", or
-    "fully_blocked"), plus any metabolite with no reactions at all
-    ("no_reactions" -- a data artifact, but worth surfacing)."""
-    produce_rxns, consume_rxns = {}, {}
-    for rxn in model.reactions:
-        lb, ub = rxn.lower_bound, rxn.upper_bound
+
+def cobra_to_stoichiometric_matrix(model):
+    """Build the stoichiometric matrix S (metabolites x reactions)."""
+    met_index = {met.id: i for i, met in enumerate(model.metabolites)}
+
+    S = sp.lil_matrix(
+        (len(model.metabolites), len(model.reactions)),
+        dtype=float,
+    )
+
+    for j, rxn in enumerate(model.reactions):
         for met, coeff in rxn.metabolites.items():
-            if coeff > 0:
-                if ub > 0:
-                    produce_rxns.setdefault(met.id, set()).add(rxn.id)
-                if lb < 0:
-                    consume_rxns.setdefault(met.id, set()).add(rxn.id)
-            elif coeff < 0:
-                if lb < 0:
-                    produce_rxns.setdefault(met.id, set()).add(rxn.id)
-                if ub > 0:
-                    consume_rxns.setdefault(met.id, set()).add(rxn.id)
+            S[met_index[met.id], j] = coeff
+
+    return S.tocsr()
+
+
+def find_dead_end_metabolites(model, exclude_transport=True):
+    """
+    Identify dead-end metabolites independently of FVA.
+
+    A metabolite is considered a dead end if it cannot BOTH:
+      - be produced by at least one allowed reaction direction, and
+      - be consumed by at least one allowed reaction direction.
+
+    Allowed directions are determined only from reaction bounds:
+      - upper_bound > 0  -> forward direction allowed
+      - lower_bound < 0  -> reverse direction allowed
+
+    FVA-blocked reactions are NOT removed or treated specially here.
+
+    Metabolites involved in cross-compartment reactions are excluded when
+    exclude_transport=True.
+    """
+
+    mets = list(model.metabolites)
+    rxns = list(model.reactions)
+
+    if not mets or not rxns:
+        return []
+
+    S = cobra_to_stoichiometric_matrix(model)
+
+    lb = np.asarray(
+        [rxn.lower_bound for rxn in rxns],
+        dtype=float,
+    )
+
+    ub = np.asarray(
+        [rxn.upper_bound for rxn in rxns],
+        dtype=float,
+    )
+
+    # ---------------------------------------------------------
+    # Reaction directionality
+    # ---------------------------------------------------------
+
+    forward_allowed = ub > 0
+    reverse_allowed = lb < 0
+
+    # ---------------------------------------------------------
+    # Stoichiometric signs
+    #
+    # Positive coefficient  -> metabolite is produced
+    # Negative coefficient  -> metabolite is consumed
+    # ---------------------------------------------------------
+
+    Spos = S.multiply(S > 0)
+    Sneg = S.multiply(S < 0)
+
+    # ---------------------------------------------------------
+    # Can each metabolite be PRODUCED?
+    #
+    # Forward reaction:
+    #     positive stoichiometric coefficient -> production
+    #
+    # Reverse reaction:
+    #     negative stoichiometric coefficient -> production
+    # ---------------------------------------------------------
+
+    production = (
+        Spos.dot(forward_allowed.astype(float))
+        - Sneg.dot(reverse_allowed.astype(float))
+    )
+
+    can_be_produced = np.asarray(
+        production > 0
+    ).ravel()
+
+    # ---------------------------------------------------------
+    # Can each metabolite be CONSUMED?
+    #
+    # Forward reaction:
+    #     negative stoichiometric coefficient -> consumption
+    #
+    # Reverse reaction:
+    #     positive stoichiometric coefficient -> consumption
+    # ---------------------------------------------------------
+
+    consumption = (
+        Sneg.dot(forward_allowed.astype(float))
+        - Spos.dot(reverse_allowed.astype(float))
+    )
+
+    can_be_consumed = np.asarray(
+        consumption < 0
+    ).ravel()
+
+    # ---------------------------------------------------------
+    # Dead end = cannot both be produced AND consumed
+    # ---------------------------------------------------------
+
+    is_dead_end = ~(can_be_produced & can_be_consumed)
+
+    dead_end_idx = np.flatnonzero(is_dead_end)
+
+    # =========================================================
+    # EXCLUDE METABOLITES INVOLVED IN CROSS-COMPARTMENT
+    # REACTIONS
+    # =========================================================
+
+    transport_met_ids = set()
+
+    if exclude_transport:
+
+        for rxn in rxns:
+
+            rxn_mets = list(rxn.metabolites)
+
+            compartments = {
+                met.compartment
+                for met in rxn_mets
+                if met.compartment is not None
+            }
+
+            if len(compartments) > 1:
+
+                for met in rxn_mets:
+                    transport_met_ids.add(met.id)
+
+    # =========================================================
+    # BUILD RESULT
+    # =========================================================
 
     dead_ends = []
-    for met in model.metabolites:
-        touching = sorted(r.id for r in met.reactions)
+
+    for i in dead_end_idx:
+
+        met = mets[i]
+
+        touching = sorted(
+            rxn.id
+            for rxn in met.reactions
+        )
+
+        # Metabolite has no reactions at all
         if not touching:
-            dead_ends.append({"id": met.id, "reason": "no_reactions", "reactions": []})
+
+            dead_ends.append({
+                "id": met.id,
+                "reason": "no_reactions",
+                "reactions": [],
+            })
+
             continue
-        can_produce = met.id in produce_rxns
-        can_consume = met.id in consume_rxns
-        if can_produce and can_consume:
+
+        # Exclude metabolites involved in cross-compartment reactions
+        if (
+            exclude_transport
+            and met.id in transport_met_ids
+        ):
             continue
-        if can_produce:
+
+        # Can be produced but not consumed
+        if can_be_produced[i]:
+
             reason = "no_consuming_reaction"
-        elif can_consume:
+
+        # Can be consumed but not produced
+        elif can_be_consumed[i]:
+
             reason = "no_producing_reaction"
+
+        # Neither production nor consumption is possible
         else:
+
             reason = "fully_blocked"
-        dead_ends.append({"id": met.id, "reason": reason, "reactions": touching})
+
+        dead_ends.append({
+            "id": met.id,
+            "reason": reason,
+            "reactions": touching,
+        })
+
     return dead_ends
 
-def compute_network_gaps_report(model, zero_cutoff=None):
-    """Combined report for the Network Gaps tab. Never changes the cached
-    model: find_blocked_reactions manages its own `with model:` internally,
-    and find_dead_end_metabolites only reads bounds/stoichiometry."""
-    reaction_types = classify_reactions(model)
-    compartment_names = {cid: compartment_display_name(cid, name) for cid, name in model.compartments.items()}
 
-    # Bug fix: find_blocked_reactions runs flux variability analysis, which
-    # (unlike a single slim_optimize call) re-solves the LP many times in a
-    # row -- one min and one max per candidate reaction -- reusing the same
-    # floating-point GLPK problem object each time. On this GLPK/Windows
-    # build that repeated-solve pattern has been observed to trigger the
-    # same fatal "glp_free: memory allocation error" crash as
-    # minimal_medium's single wide-open solve did (see run_with_exact_solver
-    # above) -- just from a different trigger (many solves vs. one poorly
-    # scaled one). Running it on glpk_exact avoids both failure modes; it's
-    # slower per solve, but find_blocked_reactions already pre-filters to
-    # only the reactions with near-zero flux in the current solution, so in
-    # practice this is far fewer solves than "every reaction x2".
+def compute_network_gaps_report(model, zero_cutoff=None):
+
+    reaction_types = classify_reactions(model)
+
+    compartment_names = {
+        cid: compartment_display_name(cid, name)
+        for cid, name in model.compartments.items()
+    }
+
+    _, _, _, met_to_mnx = detect_metabolite_namespace_and_map(model)
+    _, _, _, rxn_to_mnx = detect_reaction_namespace_and_map(model)
+
+    # =========================================================
+    # 1. BLOCKED REACTIONS
+    #
+    # Completely independent FVA-based diagnostic.
+    # =========================================================
+
     try:
+
         blocked_ids = run_with_exact_solver(
-            model, lambda: find_blocked_reactions(model, zero_cutoff=zero_cutoff, open_exchanges=False, processes=1)
+            model,
+            lambda: find_blocked_reactions(
+                model,
+                zero_cutoff=zero_cutoff,
+                open_exchanges=False,
+                processes=1,
+            ),
         )
+
     except Exception as exc:
-        return {"error": f"Could not compute blocked reactions: {exc}"}
+
+        return {
+            "error": f"Could not compute blocked reactions: {exc}"
+        }
 
     blocked_reactions = []
+
     for rxn_id in sorted(blocked_ids):
+
         rxn = model.reactions.get_by_id(rxn_id)
+
         blocked_reactions.append({
             "id": rxn.id,
+            "metanetx_id": rxn_to_mnx.get(rxn.id),
             "name": rxn.name,
             "subsystem": subsystem_value(rxn),
             "type": reaction_types.get(rxn.id, ""),
+            "compartments": sorted({m.compartment for m in rxn.metabolites if m.compartment}),
             "reaction_string": rxn.reaction,
             "lower_bound": safe_float(rxn.lower_bound),
             "upper_bound": safe_float(rxn.upper_bound),
-            "gene_reaction_rule": getattr(rxn, "gene_reaction_rule", ""),
+            "gene_reaction_rule": getattr(
+                rxn,
+                "gene_reaction_rule",
+                "",
+            ),
         })
 
+    # =========================================================
+    # 2. DEAD-END METABOLITES
+    #
+    # COMPLETELY INDEPENDENT OF blocked_ids.
+    #
+    # Uses only:
+    #   - stoichiometry
+    #   - reaction lower bounds
+    #   - reaction upper bounds
+    #
+    # No FVA results are passed into this calculation.
+    # =========================================================
+
     try:
-        dead_end_raw = find_dead_end_metabolites(model)
+
+        dead_end_raw = find_dead_end_metabolites(
+            model,
+            exclude_transport=True,
+        )
+
     except Exception as exc:
-        return {"error": f"Could not compute dead-end metabolites: {exc}"}
+
+        return {
+            "error": f"Could not compute dead-end metabolites: {exc}"
+        }
 
     dead_end_metabolites = []
+
     for d in dead_end_raw:
+
         met = model.metabolites.get_by_id(d["id"])
+
         dead_end_metabolites.append({
             "id": met.id,
+            "metanetx_id": met_to_mnx.get(met.id),
             "name": clean_metabolite_display_name(met),
             "compartment": met.compartment,
-            "compartment_name": compartment_names.get(met.compartment, met.compartment),
-            "formula": getattr(met, "formula", None),
+            "compartment_name": compartment_names.get(
+                met.compartment,
+                met.compartment,
+            ),
+            "formula": getattr(
+                met,
+                "formula",
+                None,
+            ),
             "reason": d["reason"],
             "reactions": d["reactions"],
         })
 
+    # =========================================================
+    # FINAL REPORT
+    # =========================================================
+
     return {
         "blocked_reactions": blocked_reactions,
         "dead_end_metabolites": dead_end_metabolites,
-        "zero_cutoff": safe_float(zero_cutoff) if zero_cutoff is not None else safe_float(model.tolerance),
+
+        "zero_cutoff": (
+            safe_float(zero_cutoff)
+            if zero_cutoff is not None
+            else safe_float(model.tolerance)
+        ),
+
         "note": (
-            f"{len(blocked_reactions)} blocked reaction(s) (cannot carry any flux under the model's current bounds) "
-            f"and {len(dead_end_metabolites)} dead-end metabolite(s) (can only ever be produced or only ever be "
-            "consumed given current reaction bounds/reversibility, or -- rarely -- have no reactions at all)."
+            f"{len(blocked_reactions)} blocked reaction(s) "
+            "(cannot carry flux under the model's current bounds, "
+            "using COBRApy's FVA-based analysis) and "
+            f"{len(dead_end_metabolites)} dead-end metabolite(s) "
+            "(cannot both be produced and consumed based only on "
+            "stoichiometry and reaction directionality). "
+            "The two diagnostics are independent: FVA-blocked "
+            "reactions are not used when identifying dead-end "
+            "metabolites. Metabolites participating in "
+            "cross-compartment reactions are excluded from the "
+            "dead-end list. Blocked reactions are relative to the "
+            "medium/diet currently applied to this model -- opening "
+            "or changing exchange bounds (a different diet) can "
+            "unblock a reaction shown here, or block one that isn't."
         ),
     }
 
+    
 # ---------------------------------------------------------------------------
 # Demand & Sink Audit (on-request, part of the Network Gaps tab).
 #
