@@ -8,15 +8,22 @@ bounds. Shares the same underlying cobra.medium.minimal_medium call and the
 same "target is the model's own growth, not an artificially opened one" fix
 as diet.py.
 """
-from cobra.medium import minimal_medium
-
 from annotation.naming import clean_metabolite_display_name
 from annotation.namespace_mapping import detect_metabolite_namespace_and_map, detect_reaction_namespace_and_map
+from core.memo import not_error, remember
 from core.shared import safe_float
-from diagnostics.solver_utils import run_with_exact_solver
+from diagnostics.solver_utils import solve_minimal_medium
 
 
 def compute_minimal_medium_report(model, growth_cutoff_fraction=1.0, minimize_components=False):
+    """Memoized per model and settings; see _compute_minimal_medium_report."""
+    key = ("minimal_medium", str(growth_cutoff_fraction), bool(minimize_components))
+    return remember(model, key,
+                    lambda: _compute_minimal_medium_report(model, growth_cutoff_fraction, minimize_components),
+                    cache_if=not_error)
+
+
+def _compute_minimal_medium_report(model, growth_cutoff_fraction=1.0, minimize_components=False):
     """Compute the minimal medium needed to sustain growth_cutoff_fraction of
     the model's own maximum growth rate (under its own original bounds).
     cobra's minimal_medium() already manages open_exchanges internally and
@@ -51,10 +58,7 @@ def compute_minimal_medium_report(model, growth_cutoff_fraction=1.0, minimize_co
     target_growth = wt_growth * growth_cutoff_fraction
 
     try:
-        medium = run_with_exact_solver(
-            model,
-            lambda: minimal_medium(model, target_growth, minimize_components=minimize_components, open_exchanges=True),
-        )
+        medium = solve_minimal_medium(model, target_growth, minimize_components)
     except Exception as exc:
         return {"error": f"Could not compute a minimal medium: {exc}", "wt_growth": wt_growth}
     if medium is None:

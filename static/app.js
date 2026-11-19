@@ -76,6 +76,7 @@ analyzeBtn.addEventListener("click", async () => {
 
   if (dietMode.value === "custom" && !dietFileInput.files[0]) {
     status.innerHTML = `<span class="error">Choose a diet file, or switch "Diet / media" back to something else.</span>`;
+    openDietModal();
     return;
   }
 
@@ -86,16 +87,31 @@ analyzeBtn.addEventListener("click", async () => {
   try {
     const form = new FormData();
     form.append("model", file);
-    form.append("diet_mode", dietMode.value);
-    if (dietMode.value === "custom" && dietFileInput.files[0]) {
-      form.append("diet_file", dietFileInput.files[0]);
-    }
+    addDietFields(form);
 
     // Phase 1: Quick analysis
     const quickResponse = await fetch("/api/analyze-quick", { method:"POST", body:form });
     const quickData = await quickResponse.json();
     if (!quickResponse.ok) throw new Error(quickData.error || "Analysis failed");
 
+    showAnalysis(quickData);
+  } catch (err) {
+    status.innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
+    analyzeBtn.disabled = false;
+    progressDone("mainProgress");
+  }
+});
+
+// The diet chosen in the pop-up, as form fields for /api/analyze-quick or /api/reanalyze.
+function addDietFields(form) {
+  const diet = dietUploadFields();
+  form.append("diet_mode", diet.mode);
+  if (diet.rows) form.append("diet_rows", diet.rows);
+  if (dietMode.value === "custom" && dietFileInput.files[0]) form.append("diet_file", dietFileInput.files[0]);
+}
+
+// Show the result of a fresh analysis (a new upload, or the same model under another diet).
+function showAnalysis(quickData) {
     // Store quick results and model ID
     const modelId = quickData.model_id;
     delete quickData.model_id;
@@ -107,10 +123,8 @@ analyzeBtn.addEventListener("click", async () => {
     renderDebugDefault([], []);
     BALANCE_RESULT = null;
     PRECURSOR_RESULT = null;
-    TRACER_RESULT = null;
-    TRACER_KO_VIEW = "before";
-    TRACER_HIGHLIGHT_KO = true;
-    if (TRACER_CY) { TRACER_CY.destroy(); TRACER_CY = null; }
+    resetTracer();
+    resetBackground();
     MINMED_RESULT = null;
     NETGAPS_RESULT = null;
     DSAUDIT_RESULT = null;
@@ -121,19 +135,15 @@ analyzeBtn.addEventListener("click", async () => {
 
     // Show initial results
     renderAll();
-    $("app").classList.remove("hidden");
+    showView("results");
     goToTab("overview"); // Overview is always the landing page for a new model
     status.textContent = "Performing exchange knockouts…";
 
     // Phase 2: Stream KO analysis
     streamKOAnalysis(modelId);
+    startBackground(selectedBackgroundTasks());
 
-  } catch (err) {
-    status.innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
-    analyzeBtn.disabled = false;
-    progressDone("mainProgress");
-  }
-});
+}
 
 // Kept at module scope so a new analysis run can always find and close
 // whatever stream a *previous* run left open (see streamKOAnalysis).
@@ -534,6 +544,7 @@ function renderAll() {
   renderMetabolites();
   renderExchanges();
   renderObjective();
+  renderUptake();
   renderMinimalMedium();
   renderNetworkGaps();
   renderTracer();
@@ -542,13 +553,15 @@ function renderAll() {
   renderReferences();
   renderBalance();
   renderPrecursors();
+  renderModelCompare();
+  renderTranslate(); renderMetanetxTranslate(); renderGenes(); renderThresholdRows();
 }
 
 function renderSummary() {
   const s = DATA.stats;
   const cards = [
     ["Genes", s.genes], ["Metabolites", s.metabolites], ["Reactions", s.reactions],
-    ["Compartments", s.compartments], ["WT growth", fmt(s.wt_growth)], ["Solver", s.solver]
+    ["Compartments", s.compartments], ["WT growth", `${fmt(s.wt_growth)} h⁻¹`], ["Solver", s.solver]
   ];
   $("summary").innerHTML = cards.map(([l,v]) =>
     `<div class="summary-card"><div class="label">${escapeHtml(l)}</div><div class="value">${escapeHtml(v)}</div></div>`
@@ -642,17 +655,17 @@ function renderOverview() {
       <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(s.reactions)}</div><div class="mini-stat-label">Reactions</div></div>
       <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(s.genes)}</div><div class="mini-stat-label">Genes</div></div>
       <div class="mini-stat" title="Genes : reactions, i.e. one gene maps to roughly this many reactions on average."><div class="mini-stat-value">${escapeHtml(grLabel)}</div><div class="mini-stat-label">Gene : Reaction ratio</div></div>
-      <div class="mini-stat"><div class="mini-stat-value">${fmt(s.wt_growth)}</div><div class="mini-stat-label">WT growth</div></div>
+      <div class="mini-stat"><div class="mini-stat-value">${fmt(s.wt_growth)} <span class="unit">h⁻¹</span></div><div class="mini-stat-label">WT growth (per hour)</div></div>
       <div class="mini-stat"><div class="mini-stat-value">${escapeHtml(s.solver)}</div><div class="mini-stat-label">Solver</div></div>
     </div>
-
-    <div id="memoteBox"></div>
 
     <h3>Compartments</h3>
     <div class="chip-row">${s.compartment_details.map(c => {
       const extra = c.raw_name && c.raw_name !== c.name ? ` (model-provided name: ${c.raw_name})` : "";
       return `<span class="badge" title="Compartment code: ${escapeHtml(c.id)}${escapeHtml(extra)}">${escapeHtml(c.name)}</span>`;
     }).join(" ")}</div>
+
+    ${maintenanceOverviewHtml()}
 
     <h3>Other details</h3>
     <dl class="kv">
@@ -735,11 +748,17 @@ const REACTION_TABLE_COLUMNS = [
   { key: "id", label: "Original ID" },
   { key: "metanetx_id", label: "MetaNetX ID" },
   { key: "name", label: "Name" },
+  { key: "equation", label: "Reaction formula" },
   { key: "type", label: "Type" },
   { key: "subsystem", label: "Subsystem" },
   { key: "gene_reaction_rule", label: "GPR" },
   { key: "compartments", label: "Compartment", value: r => (r.compartments || []).map(c => COMP_NAMES[c] || c).join("; ") },
+  { key: "lower_bound", label: "LB" },
+  { key: "upper_bound", label: "UB" },
   { key: "wt_flux", label: "WT flux" },
+  { key: "fva_min", label: "FVA min" },
+  { key: "fva_max", label: "FVA max" },
+  { key: "fva_blocked", label: "Blocked (FVA)", value: r => r.fva_blocked === undefined ? "" : r.fva_blocked ? "Yes" : "No" },
   { key: "balance", label: "Balance" },
   { key: "balance_detail", label: "Imbalance / note" },
 ];
@@ -768,7 +787,7 @@ function renderReactions() {
     ${reactionStatsHtml(DATA.reactions)}
     <h3>Reactions</h3>
     <div class="toolbar">
-      <input id="rxnSearch" type="text" placeholder="Search ID, name, subsystem…">
+      <input id="rxnSearch" type="text" placeholder="Search ID, name, formula, subsystem…">
       <select id="rxnType"><option value="">All types</option>${types.map(t => `<option>${escapeHtml(t)}</option>`).join("")}</select>
       <select id="rxnSubsystem"><option value="">All subsystems</option>${subsystems(DATA.reactions).map(t => `<option>${escapeHtml(t)}</option>`).join("")}</select>
       <select id="rxnMapped">
@@ -788,6 +807,11 @@ function renderReactions() {
         <option value="unknown">Balance: can't check (no formula)</option>
         <option value="n/a">Balance: not applicable</option>
       </select>
+      <select id="rxnFva" title="Needs the FVA background analysis">
+        <option value="">FVA: all</option>
+        <option value="blocked">FVA: blocked</option>
+        <option value="free">FVA: can carry flux</option>
+      </select>
       <select id="rxnComp">
         <option value="">All compartments</option>
         ${[...new Set(DATA.reactions.flatMap(r => r.compartments || []))].sort().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(COMP_NAMES[c] || c)}</option>`).join("")}
@@ -800,11 +824,16 @@ function renderReactions() {
         <th data-key="id">Original ID</th>
         <th data-key="metanetx_id">MetaNetX ID</th>
         <th data-key="name">Name</th>
+        <th data-key="equation">Reaction formula</th>
         <th data-key="type">Type</th>
         <th data-key="subsystem">Subsystem</th>
         <th data-key="gene_reaction_rule">GPR</th>
         <th data-key="compartments">Compartment</th>
+        <th data-key="lower_bound" title="Lower bound (negative = reverse direction allowed)">LB</th>
+        <th data-key="upper_bound">UB</th>
         <th data-key="wt_flux">WT flux</th>
+        <th data-key="fva_min" title="Flux range from FVA (objective not constrained). Fills in when the FVA background analysis has run.">FVA min</th>
+        <th data-key="fva_max" title="Flux range from FVA (objective not constrained). Fills in when the FVA background analysis has run.">FVA max</th>
         <th data-key="balance" title="Mass/charge balance of the reaction">Balance</th>
       </tr></thead>
       <tbody id="rxnBody"></tbody>
@@ -818,13 +847,15 @@ function renderReactions() {
     const gpr = $("rxnGpr").value;
     const comp = $("rxnComp").value;
     const bal = $("rxnBalance").value;
+    const fvaF = $("rxnFva").value;
     const rows = filtered ? filtered : DATA.reactions.filter(r =>
-      (!q || `${r.id} ${r.metanetx_id || ""} ${r.name} ${r.subsystem} ${r.gene_reaction_rule}`.toLowerCase().includes(q)) &&
+      searchMatches(q, r.id, `${r.id} ${r.metanetx_id || ""} ${r.name} ${r.equation || ""} ${r.subsystem} ${r.gene_reaction_rule}`) &&
       (!type || r.type === type) && (!sub || r.subsystem === sub) &&
       (!mapped || (mapped === "mapped" ? !!r.metanetx_id : !r.metanetx_id)) &&
       (!gpr || (gpr === "has" ? !!(r.gene_reaction_rule || "").trim() : !(r.gene_reaction_rule || "").trim())) &&
       (!comp || (r.compartments || []).includes(comp)) &&
-      (!bal || (r.balance || "n/a") === bal)
+      (!bal || (r.balance || "n/a") === bal) &&
+      (!fvaF || (fvaF === "blocked" ? r.fva_blocked === true : r.fva_blocked === false))
     );
     rxnCurrentRows = rows;
     const bar = $("rxnBalanceBar");
@@ -838,18 +869,23 @@ function renderReactions() {
     }
     $("rxnCount").textContent = `${rows.length} / ${DATA.reactions.length}`;
     $("rxnBody").innerHTML = rows.map(r => `<tr class="${r.metanetx_id ? "" : "row-unmapped"}" title="${r.metanetx_id ? "" : "Not mapped to MetaNetX -- see the warning in the Overview tab"}">
-      <td><strong>${escapeHtml(r.id)}</strong></td>
+      <td><strong>${escapeHtml(r.id)}</strong>${r.fva_blocked ? ' <span class="badge bad" title="Cannot carry flux under the current bounds (FVA)">blocked</span>' : ""}</td>
       <td>${escapeHtml(r.metanetx_id || "—")}</td>
       <td class="wrap">${escapeHtml(r.name)}</td>
+      <td class="wrap ent-eq">${equationHtml(r.equation)}</td>
       <td>${reactionTypeBadge(r.type)}</td><td>${escapeHtml(r.subsystem || "—")}</td>
-      <td class="wrap">${escapeHtml(r.gene_reaction_rule || "—")}</td>
+      <td class="wrap">${gprHtml(r.gene_reaction_rule)}</td>
       <td>${compartmentBadges(r.compartments)}</td>
+      <td class="num">${fmt(r.lower_bound, 2)}</td>
+      <td class="num">${fmt(r.upper_bound, 2)}</td>
       <td class="num">${fmt(r.wt_flux)}</td>
+      <td class="num">${r.fva_min === undefined ? "—" : fmt(r.fva_min)}</td>
+      <td class="num">${r.fva_max === undefined ? "—" : fmt(r.fva_max)}</td>
       <td>${balanceBadge(r)}</td>
     </tr>`).join("");
     $("rxnBody").querySelectorAll(".bal-link").forEach(a => a.addEventListener("click", () => openBalanceDiagnostics(a.dataset.rxn)));
   };
-  ["rxnSearch","rxnType","rxnSubsystem","rxnMapped","rxnGpr","rxnComp","rxnBalance"].forEach(id => $(id).addEventListener("input", () => redraw()));
+  ["rxnSearch","rxnType","rxnSubsystem","rxnMapped","rxnGpr","rxnComp","rxnBalance","rxnFva"].forEach(id => $(id).addEventListener("input", () => redraw()));
   redraw();
   setTimeout(() => makeSortable("rxnTable", DATA.reactions, redraw), 0);
   attachTableTools("rxnTable", $("reactions").querySelector(".toolbar"), REACTION_TABLE_COLUMNS, () => rxnCurrentRows, "reactions");
@@ -866,6 +902,8 @@ const METABOLITE_TABLE_COLUMNS = [
   { key: "produced_count", label: "# Produced in" },
   { key: "consumed_count", label: "# Consumed in" },
   { key: "reversible_count", label: "# Reversible" },
+  { key: "dead_end", label: "Dead end", value: m => m.dead_end || "" },
+  { key: "reactions", label: "Reactions", value: m => (m.reactions || []).join("; ") },
 ];
 
 let metCurrentRows = [];
@@ -881,6 +919,11 @@ function renderMetabolites() {
         <option value="mapped">MetaNetX: mapped only</option>
         <option value="unmapped">MetaNetX: unmapped only</option>
       </select>
+      <select id="metDead" title="Needs the dead-end background analysis">
+        <option value="">Dead ends: all</option>
+        <option value="yes">Dead ends only</option>
+        <option value="no">Not dead ends</option>
+      </select>
       <span id="metCount"></span>
     </div>
     <div class="table-wrap"><table id="metTable">
@@ -895,6 +938,8 @@ function renderMetabolites() {
         <th data-key="produced_count"># Produced in</th>
         <th data-key="consumed_count"># Consumed in</th>
         <th data-key="reversible_count"># Reversible</th>
+        <th data-key="dead_end" title="Dead-end class from GapFind. Fills in when the dead-end background analysis has run.">Dead end</th>
+        <th>Reactions</th>
       </tr></thead>
       <tbody id="metBody"></tbody>
     </table></div>
@@ -903,8 +948,10 @@ function renderMetabolites() {
     const q = $("metSearch").value.toLowerCase();
     const comp = $("metComp").value;
     const mapped = $("metMapped").value;
+    const deadF = $("metDead").value;
     const rows = filtered ? filtered : DATA.metabolites.filter(m =>
-      (!q || `${m.id} ${m.metanetx_id || ""} ${m.name} ${m.formula}`.toLowerCase().includes(q)) &&
+      (!deadF || (deadF === "yes" ? !!m.dead_end : m.dead_end === null)) &&
+      searchMatches(q, m.id, `${m.id} ${m.metanetx_id || ""} ${m.name} ${m.formula}`) &&
       (!comp || m.compartment === comp) &&
       (!mapped || (mapped === "mapped" ? !!m.metanetx_id : !m.metanetx_id))
     );
@@ -920,9 +967,11 @@ function renderMetabolites() {
       <td class="num">${m.produced_count ?? 0}</td>
       <td class="num">${m.consumed_count ?? 0}</td>
       <td class="num">${m.reversible_count ?? 0}</td>
+      <td>${m.dead_end ? `<span class="badge bad">${escapeHtml(m.dead_end)}</span>` : m.dead_end === null ? "—" : ""}</td>
+      <td>${metReactionLinks(m)}</td>
     </tr>`).join("");
   };
-  ["metSearch","metComp","metMapped"].forEach(id => $(id).addEventListener("input", () => redraw()));
+  ["metSearch","metComp","metMapped","metDead"].forEach(id => $(id).addEventListener("input", () => redraw()));
   redraw();
   setTimeout(() => makeSortable("metTable", DATA.metabolites, redraw), 0);
   attachTableTools("metTable", $("metabolites").querySelector(".toolbar"), METABOLITE_TABLE_COLUMNS, () => metCurrentRows, "metabolites");
@@ -971,7 +1020,7 @@ function renderExchanges() {
       <select id="exEssential"><option value="">All</option><option value="essential">Essential only</option><option value="nonessential">Non-essential</option></select>
       <select id="exUptake"><option value="">Uptake: all</option><option value="yes">Uptake allowed</option><option value="no">Uptake blocked</option></select>
       <span id="exCount"></span>
-      ${essentialExchanges.length > 0 ? `<button id="debugExBtn" style="margin-left:auto;">🔍 Debug Essential Exchanges (${essentialExchanges.length})</button>` : ''}
+      ${essentialExchanges.length > 0 ? `<button id="debugExBtn" style="margin-left:auto;">🔍 Visualize exchanges (${essentialExchanges.length} essential)</button>` : ''}
     </div>
     <div class="table-wrap"><table id="exTable">
       <thead><tr>
@@ -996,7 +1045,7 @@ function renderExchanges() {
   if (essentialExchanges.length > 0) {
     const debugBtn = $("debugExBtn");
     if (debugBtn) {
-      debugBtn.addEventListener("click", () => showDebugModal(essentialExchanges));
+      debugBtn.addEventListener("click", () => showDebugModal());
     }
   }
 
@@ -1049,7 +1098,7 @@ function growthBar(fraction) {
 function buildExchangeTooltipHtml(r) {
   return `
     <div class="tooltip-title">${escapeHtml(r.id)}${r.name ? ` — ${escapeHtml(r.name)}` : ""}</div>
-    <div class="tooltip-row"><span class="tooltip-label">Reaction</span><code>${escapeHtml(r.reaction_string || "—")}</code></div>
+    <div class="tooltip-row"><span class="tooltip-label">Reaction</span><code>${escapeHtml(shortEquation(r.reaction_string) || "—")}</code></div>
     <div class="tooltip-row"><span class="tooltip-label">Subsystem</span>${escapeHtml(r.subsystem || "—")}</div>
     <div class="tooltip-row"><span class="tooltip-label">GPR</span>${escapeHtml(r.gene_reaction_rule || "—")}</div>
     <div class="tooltip-row"><span class="tooltip-label">Bounds</span>[${fmt(r.lower_bound, 2)}, ${fmt(r.upper_bound, 2)}]</div>
@@ -1167,6 +1216,27 @@ function objectiveReactionExpressionHtml(open) {
   `;
 }
 
+// ATP maintenance (GAM in the biomass reaction, NGAM as a forced ATP-hydrolysis reaction), with warnings.
+function maintenanceOverviewHtml() {
+  const m = DATA.maintenance || { ngam: [], gam: [] };
+  const box = (title, items, warns) => `<div class="maint-card ${items.length ? "" : "missing"}">
+    <div class="maint-title">${title}</div>
+    ${items.length ? items.join("") : `<div class="maint-value muted">not found</div>`}
+    ${warns.map(w => `<div class="warn-box maint-warn">${w}</div>`).join("")}</div>`;
+  const gam = m.gam.map(g => `<div class="maint-item"><div class="maint-value">${fmt(g.coefficient)} <span>mmol ATP / gDW biomass</span></div>
+    <div class="maint-sub">in ${entityLink("rxn", g.reaction)}</div></div>`);
+  const ngam = m.ngam.map(n => `<div class="maint-item"><div class="maint-value">${fmt(n.lower_bound)} <span>mmol ATP / gDW / h minimum${n.forced ? "" : " (not forced)"}</span></div>
+    <div class="maint-sub">${entityLink("rxn", n.id)} ${escapeHtml(n.name || "")}<br>bounds [${fmt(n.lower_bound)}, ${fmt(n.upper_bound)}]</div></div>`);
+  const gw = [], nw = [];
+  if (!m.gam.length) gw.push("<strong>No GAM found.</strong> The biomass/objective reaction does not consume ATP (ATP + H2O → ADP + Pi + H+), so the energy cost of growth is not modelled. Check the biomass reaction if it should be.");
+  if (!m.ngam.length) nw.push("<strong>No NGAM found.</strong> No ATP-hydrolysis maintenance reaction (such as ATPM) was found, so the cost of staying alive without growing is not modelled.");
+  else if (!m.ngam.some(n => n.forced)) nw.push("The NGAM reaction has no forced lower bound (it is 0), so maintenance is optional rather than required.");
+  if (m.ngam.some(n => n.forced) && (DATA.stats.wt_growth || 0) < 1e-9)
+    nw.push("The model cannot grow while a forced NGAM must be met. If ATP regeneration is broken (common in draft models), this can be the cause.");
+  return `<h3>ATP maintenance (GAM / NGAM)</h3>
+    <div class="maint-grid">${box("GAM — growth-associated", gam, gw)}${box("NGAM — non-growth-associated", ngam, nw)}</div>`;
+}
+
 function renderObjective() {
   $("objective").innerHTML = `
     ${objectiveReactionExpressionHtml()}
@@ -1210,7 +1280,7 @@ function renderObjective() {
     objCurrentRows = rows;
 
     $("objBody").innerHTML = rows.length > 0 ? rows.map(o => `<tr>
-      <td><strong><a href="#met-${escapeHtml(o.metabolite_id)}" style="cursor:pointer;color:inherit;text-decoration:underline;">${escapeHtml(o.metabolite_id)}</a></strong></td>
+      <td><strong>${entityLink("met", o.metabolite_id)}</strong></td>
       <td>${escapeHtml(o.metabolite_metanetx_id || "—")}</td>
       <td class="col-name-md" title="${escapeHtml(o.metabolite_name || "")}">${escapeHtml(o.metabolite_name || "—")}</td>
       <td>${compartmentBadges([o.compartment])}</td>
@@ -1218,7 +1288,7 @@ function renderObjective() {
       <td>${biomassRoleBadge(o.biomass_role)}</td>
       <td>${o.direct_exchange ? `<strong>${escapeHtml(o.direct_exchange)}</strong>` : "—"}</td>
       <!-- <td class="num">${o.appears_in_reactions}</td> -->
-      <td class="num">${o.reaction_count ?? 0}</td>
+      <td class="num">${metReactionsLink(o.metabolite_id, o.reaction_count ?? 0)}</td>
       <td class="num">${o.produced_count ?? 0}</td>
       <td class="num">${o.consumed_count ?? 0}</td>
       <td class="num">${o.reversible_count ?? 0}</td>
@@ -1396,17 +1466,15 @@ function renderMinimalMediumTable(components) {
 }
 
 // ---------------------------------------------------------------------------
-// Network Gaps tab (on-request, as soon as the model loads).
-//
-// Two complementary diagnostics under the model's current bounds (whatever
-// diet was applied at upload): reactions that can't carry any flux at all
-// ("blocked"), and metabolites that structurally can only ever be produced
-// or only ever be consumed ("dead ends") -- often *why* a reaction ends up
-// blocked, though not the only possible reason, which is why both are shown
-// together. Both tables export to CSV independently.
+// Network Gaps tab (on request). Two steps, shown as they finish:
+//   1. dead-end metabolites (GapFind), each as root / downstream no-production
+//      or root / upstream no-consumption;
+//   2. blocked reactions (flux variability), split into dead-end-linked and
+//      not dead-end-linked.
+// Class chips (gap_classes.js) filter the tables, which export to CSV on their own.
 // ---------------------------------------------------------------------------
 
-let NETGAPS_RESULT = null;
+let NETGAPS_RESULT = null;   // both steps, set once the second one is done
 
 const NETGAPS_BLOCKED_CSV_COLUMNS = [
   { key: "id", label: "Original ID" },
@@ -1418,44 +1486,39 @@ const NETGAPS_BLOCKED_CSV_COLUMNS = [
   { key: "lower_bound", label: "LB" },
   { key: "upper_bound", label: "UB" },
   { key: "gene_reaction_rule", label: "GPR" },
+  { key: "class_label", label: "Class" },
+  { key: "dead_end_metabolites", label: "Linked dead-end metabolites", value: r => join(r.dead_end_metabolites) },
   { key: "reaction_string", label: "Reaction" },
 ];
+// The table shows every column but the last, which is offered only in the Export panel.
+const NETGAPS_BLOCKED_TABLE_COLUMNS = NETGAPS_BLOCKED_CSV_COLUMNS.slice(0, -1);
 const NETGAPS_DEADEND_CSV_COLUMNS = [
   { key: "id", label: "Metabolite Original ID" },
   { key: "metanetx_id", label: "Metabolite MetaNetX ID" },
   { key: "name", label: "Metabolite name" },
   { key: "compartment", label: "Compartment" },
-  { key: "reason", label: "Reason" },
+  { key: "class_label", label: "Class" },
   { key: "reactions", value: r => join(r.reactions), label: "Reactions involved" },
 ];
-// Positional subset of NETGAPS_BLOCKED_CSV_COLUMNS matching the Blocked
-// reactions table's actual <th> order (that constant has one extra field,
-// reaction_string, offered only in the Export panel via exportColumns, not
-// shown as its own table column).
-const NETGAPS_BLOCKED_TABLE_COLUMNS = NETGAPS_BLOCKED_CSV_COLUMNS.slice(0, 9);
 
-const NETGAPS_REASON_LABELS = {
-  no_consuming_reaction: "Never consumed (only ever produced)",
-  no_producing_reaction: "Never produced (only ever consumed)",
-  fully_blocked: "Fully blocked (bounds allow neither direction)",
-  no_reactions: "No reactions at all",
-};
+let gapsDeadData = null, gapsBlockedData = null;   // the two steps' results
+let gapsBlockedCurrentRows = [];
+let gapsDeadendCurrentRows = [];
 
 function renderNetworkGaps() {
+  gapsDeadData = gapsBlockedData = null;
   $("gaps").innerHTML = `
-    <h2>Blocked reactions &amp; dead-end metabolites</h2>
+    <h2>Dead-end metabolites &amp; blocked reactions</h2>
     <div class="note">
-      Two independent structural diagnostics: reactions that can't carry any flux at all under the model's
-      current bounds (via COBRApy's flux-variability-based <code>find_blocked_reactions</code>), and metabolites
-      that can only ever be produced or only ever be consumed given their reactions' bounds/reversibility alone
-      ("dead ends", judged purely by stoichiometry and directionality — not informed by the blocked-reaction
-      results). Any metabolite that participates in a transport reaction is excluded from the dead-end list,
-      since a transporter can supply or drain that exact species from another compartment even when it looks
-      locally dead-ended. Neither diagnostic ever changes the analyzed model.
-      <strong>Blocked reactions are relative to the medium/diet currently applied to this model</strong> —
-      switching to a different diet (or editing exchange bounds) can unblock a reaction shown here, or block one
-      that isn't. Blocked-reaction detection can take a while for large models (it runs flux variability analysis
-      on every reaction that carries no flux in the current solution).
+      Two steps, each shown as soon as it finishes. <strong>1. Dead-end metabolites</strong> are found with GapFind
+      (Kumar et al. 2007), with all exchange reactions opened so that the gaps are those of the network itself:
+      <em>root no-production</em> (no reaction can make it), <em>downstream no-production</em> (its producers need a
+      metabolite that cannot be made), <em>root no-consumption</em> (no reaction can use it) and <em>upstream
+      no-consumption</em> (its consumers lead only to one that cannot be used).
+      <strong>2. Blocked reactions</strong> are those that carry no flux in a flux variability analysis, split into
+      <em>dead-end-linked</em> (the reaction involves a dead-end metabolite) and <em>not dead-end-linked</em>.
+      Blocked reactions are relative to the medium currently applied; the FVA can take a while for large models.
+      Nothing here changes the model.
     </div>
     <div class="toolbar">
       <button id="gapsRunBtn" type="button">Compute network gaps</button>
@@ -1486,59 +1549,65 @@ function renderNetworkGaps() {
   $("dsAuditRunBtn").addEventListener("click", runDemandSinkAudit);
 }
 
+async function postForGaps(url) {
+  const res = await fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: MODEL_ID }),
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error || "Network gaps computation failed");
+  return data;
+}
+
 async function runNetworkGaps() {
   if (!MODEL_ID) {
     $("gapsStatus").innerHTML = `<span class="error">Model session expired — please re-run the initial analysis.</span>`;
     return;
   }
-
   const btn = $("gapsRunBtn");
   btn.disabled = true;
-  $("gapsStatus").textContent = "Computing blocked reactions and dead-end metabolites…";
   progressStart("gapsProgress");
-  $("gapsResults").innerHTML = "";
+  gapsDeadData = gapsBlockedData = NETGAPS_RESULT = null;
   $("gapsCount").textContent = "";
-
+  $("gapsResults").innerHTML = `
+    <h3>Dead-end metabolites</h3><div id="gapsDeadChips"></div><div id="gapsDeadendWrap"></div>
+    <h3>Blocked reactions</h3><div id="gapsBlockedChips"></div><div id="gapsBlockedWrap"></div>`;
   try {
-    const res = await fetch("/api/network-gaps", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: MODEL_ID }),
-    });
-    const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error || "Network gaps computation failed");
+    $("gapsStatus").textContent = "Step 1 of 2: finding dead-end metabolites (GapFind)…";
+    gapsDeadData = await postForGaps("/api/dead-end-metabolites");
+    gapsFilter.dead = gapsFilter.blocked = null;
+    $("gapsCount").textContent = `${gapsDeadData.dead_end_metabolites.length} dead-end metabolite(s)`;
+    drawGapTables();
 
-    NETGAPS_RESULT = data;
-    $("gapsStatus").textContent = data.note || "";
-    progressDone("gapsProgress");
-    $("gapsCount").textContent =
-      `${data.blocked_reactions.length} blocked reaction(s) · ${data.dead_end_metabolites.length} dead-end metabolite(s)`;
-    renderNetworkGapsResults(data);
+    $("gapsStatus").textContent = "Step 2 of 2: finding blocked reactions (flux variability analysis)…";
+    $("gapsBlockedWrap").innerHTML = `<div class="note">Running…</div>`;
+    gapsBlockedData = await postForGaps("/api/blocked-reactions");
+    NETGAPS_RESULT = { ...gapsDeadData, ...gapsBlockedData, note: `${gapsDeadData.note} ${gapsBlockedData.note}` };
+    $("gapsStatus").textContent = NETGAPS_RESULT.note;
+    $("gapsCount").textContent += ` · ${gapsBlockedData.blocked_reactions.length} blocked reaction(s)`;
+    drawGapTables();
+    if (typeof updateThresholdVerdicts === "function") setTimeout(updateThresholdVerdicts, 0);
   } catch (err) {
-    NETGAPS_RESULT = null;
     $("gapsStatus").innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
-    progressDone("gapsProgress");
-    $("gapsResults").innerHTML = "";
   } finally {
+    progressDone("gapsProgress");
     btn.disabled = false;
   }
 }
 
-function renderNetworkGapsResults(data) {
-  $("gapsResults").innerHTML = `
-    <h3>Blocked reactions</h3>
-    <div id="gapsBlockedWrap"></div>
-    <h3>Dead-end metabolites</h3>
-    <div id="gapsDeadendWrap"></div>
-  `;
-  renderBlockedReactionsTable(data.blocked_reactions || []);
-  setTimeout(() => makeSortable("gapsBlockedTable", data.blocked_reactions || [], renderBlockedReactionsTable), 0);
-  renderDeadEndTable(data.dead_end_metabolites || []);
-  setTimeout(() => makeSortable("gapsDeadendTable", data.dead_end_metabolites || [], renderDeadEndTable), 0);
+// (Re)draws chips and tables for whichever steps have finished, from the class filters.
+function drawGapTables() {
+  drawGapChips();
+  if (gapsDeadData) {
+    const dead = gapRows("dead");
+    renderDeadEndTable(dead);
+    setTimeout(() => makeSortable("gapsDeadendTable", dead, renderDeadEndTable), 0);
+  }
+  if (gapsBlockedData) {
+    const blocked = gapRows("blocked");
+    renderBlockedReactionsTable(blocked);
+    setTimeout(() => makeSortable("gapsBlockedTable", blocked, renderBlockedReactionsTable), 0);
+  }
 }
-
-let gapsBlockedCurrentRows = [];
-let gapsDeadendCurrentRows = [];
 
 function renderBlockedReactionsTable(rows) {
   gapsBlockedCurrentRows = rows;
@@ -1560,9 +1629,11 @@ function renderBlockedReactionsTable(rows) {
         <th data-key="lower_bound">LB</th>
         <th data-key="upper_bound">UB</th>
         <th data-key="gene_reaction_rule">GPR</th>
+        <th data-key="class_label">Class</th>
+        <th>Linked dead-end metabolites</th>
       </tr></thead>
       <tbody>${rows.map(r => `<tr class="${r.metanetx_id ? "" : "row-unmapped"}">
-        <td><strong>${escapeHtml(r.id)}</strong></td>
+        <td><strong>${entityLink("rxn", r.id)}</strong></td>
         <td>${escapeHtml(r.metanetx_id || "—")}</td>
         <td class="wrap">${escapeHtml(r.name || "—")}</td>
         <td>${escapeHtml(r.subsystem || "—")}</td>
@@ -1570,7 +1641,9 @@ function renderBlockedReactionsTable(rows) {
         <td>${compartmentBadges(r.compartments)}</td>
         <td class="num">${fmt(r.lower_bound, 2)}</td>
         <td class="num">${fmt(r.upper_bound, 2)}</td>
-        <td class="wrap">${escapeHtml(r.gene_reaction_rule || "—")}</td>
+        <td class="wrap">${gprHtml(r.gene_reaction_rule)}</td>
+        <td>${gapClassBadge(r.class, r.class_label)}</td>
+        <td class="wrap">${entityLinkList("met", r.dead_end_metabolites)}</td>
       </tr>`).join("")}</tbody>
     </table></div>
   `;
@@ -1592,16 +1665,16 @@ function renderDeadEndTable(rows) {
         <th data-key="metanetx_id">Metabolite MetaNetX ID</th>
         <th data-key="name">Metabolite name</th>
         <th data-key="compartment">Compartment</th>
-        <th data-key="reason">Reason</th>
+        <th data-key="class_label">Class</th>
         <th data-key="reactions">Reactions involved</th>
       </tr></thead>
       <tbody>${rows.map(r => `<tr>
-        <td><strong>${escapeHtml(r.id)}</strong></td>
+        <td><strong>${entityLink("met", r.id)}</strong></td>
         <td>${escapeHtml(r.metanetx_id || "—")}</td>
         <td>${escapeHtml(r.name || "—")}</td>
         <td>${compartmentBadges([r.compartment])}</td>
-        <td>${escapeHtml(NETGAPS_REASON_LABELS[r.reason] || r.reason)}</td>
-        <td class="wrap">${escapeHtml(join(r.reactions))}</td>
+        <td>${r.classes.map(c => gapClassBadge(c, gapsDeadData.class_labels[c])).join(" ")}</td>
+        <td class="wrap">${entityLinkList("rxn", r.reactions)}</td>
       </tr>`).join("")}</tbody>
     </table></div>
   `;
@@ -1719,708 +1792,6 @@ function renderDemandSinkAuditTable(rows) {
 }
 
 // ---------------------------------------------------------------------------
-// Exchange debugging (on-request, after the initial analysis).
-//
-// Trace, for each essential exchange the user picks, the active-flux path
-// from the exchanged metabolite through to biomass — once with the exchange
-// active ("before KO") and once with it reversibly knocked out ("after KO"),
-// so the two can be compared side by side.
-// ---------------------------------------------------------------------------
-
-function showDebugModal(essentialExchanges) {
-  renderDebugSelection(essentialExchanges);
-  $("debugTab").click();
-}
-
-// The Exchange Debugging tab is always available. Until the exchange
-// essentiality analysis has finished it shows a short waiting message; once
-// done it shows the selection of essential exchanges to trace.
-function renderDebugDefault(exchanges, essentialExchanges) {
-  if (!exchanges || !exchanges.length) {
-    $("debug").innerHTML = `<div class="note">Exchange debugging starts from the essential exchanges found by the exchange essentiality analysis. That analysis is still running (or hasn't started) — this page fills in automatically when it finishes.</div>`;
-  } else if (!essentialExchanges.length) {
-    $("debug").innerHTML = `<div class="note" style="background:#ecfdf5;border-color:#a7f3d0;color:#047857;">No essential exchanges were found, so there is nothing to debug here. (Essential = knocking out the exchange drops growth below 5% of wild type.)</div>`;
-  } else {
-    renderDebugSelection(essentialExchanges);
-  }
-}
-
-function renderDebugSelection(essentialExchanges) {
-  const rows = essentialExchanges.map(e => `
-    <label class="debug-check-row">
-      <input type="checkbox" class="debugExCheck" value="${escapeHtml(e.id)}" checked>
-      <span class="debug-check-id">${escapeHtml(e.id)}</span>
-      <span class="debug-check-name">${escapeHtml(join(e.metabolite_names) || join(e.metabolites))}</span>
-    </label>`).join("");
-
-  $("debug").innerHTML = `
-    <div class="note">
-      Trace active flux from each selected essential exchange's metabolite through to biomass — once with the
-      exchange active (before knockout) and once with it blocked (after knockout). Only reactions carrying
-      non-zero flux in the current FBA solution are followed, so a missing path can mean the metabolite is
-      rerouted differently after knockout, or that no active route to biomass remains.
-    </div>
-    <div class="toolbar">
-      <button id="debugSelectAll" type="button">Select all</button>
-      <button id="debugSelectNone" type="button">Select none</button>
-      <span id="debugSelCount"></span>
-      <label class="debug-toggle">
-        <input type="checkbox" id="debugHideTrivial" checked>
-        Hide common cofactors (H, H2O, ATP/ADP, NAD(H), Pi…)
-      </label>
-      <button id="debugRunBtn" type="button" style="margin-left:auto;">Run debugging analysis</button>
-    </div>
-    <div class="debug-select-list">${rows || '<div class="note">No essential exchanges to debug.</div>'}</div>
-    <div id="debugStatus" class="debug-status"></div>
-    ${progressBarHtml("debugProgress")}
-    <div id="debugResults"></div>
-  `;
-
-  const checks = () => Array.from(document.querySelectorAll(".debugExCheck"));
-  const updateCount = () => {
-    const n = checks().filter(c => c.checked).length;
-    $("debugSelCount").textContent = `${n} selected`;
-  };
-  checks().forEach(c => c.addEventListener("change", updateCount));
-  updateCount();
-
-  const selectAllBtn = $("debugSelectAll");
-  const selectNoneBtn = $("debugSelectNone");
-  if (selectAllBtn) selectAllBtn.addEventListener("click", () => { checks().forEach(c => c.checked = true); updateCount(); });
-  if (selectNoneBtn) selectNoneBtn.addEventListener("click", () => { checks().forEach(c => c.checked = false); updateCount(); });
-
-  const runBtn = $("debugRunBtn");
-  if (runBtn) {
-    runBtn.addEventListener("click", () => {
-      const selected = checks().filter(c => c.checked).map(c => c.value);
-      if (!selected.length) {
-        $("debugStatus").innerHTML = `<span class="error">Select at least one exchange to debug.</span>`;
-        return;
-      }
-      const hideTrivial = $("debugHideTrivial") ? $("debugHideTrivial").checked : true;
-      runDebugAnalysis(selected, hideTrivial);
-    });
-  }
-}
-
-async function runDebugAnalysis(exchangeIds, hideTrivial) {
-  const btn = $("debugRunBtn");
-  if (btn) btn.disabled = true;
-  $("debugStatus").textContent = `Tracing ${exchangeIds.length} exchange(s) to biomass (before and after knockout)…`;
-  progressStart("debugProgress");
-  $("debugResults").innerHTML = "";
-
-  try {
-    if (!MODEL_ID) throw new Error("Model session expired — please re-run the initial analysis.");
-
-    const res = await fetch("/api/debug-exchanges", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model_id: MODEL_ID,
-        exchange_ids: exchangeIds,
-        exclude_trivial_metabolites: hideTrivial,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error || "Debug analysis failed");
-
-    $("debugStatus").textContent = `Done. Biomass reaction: ${data.biomass_reaction}. ${data.trivial_metabolite_rule || ""}`;
-    progressDone("debugProgress");
-    renderDebugResults(data.results);
-  } catch (err) {
-    $("debugStatus").innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
-    progressDone("debugProgress");
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-function renderDebugResults(results) {
-  const cards = Object.entries(results).map(([exchId, r]) => {
-    if (r.error) {
-      return `<div class="debug-card">
-        <h3>${escapeHtml(exchId)}</h3>
-        <div class="error">${escapeHtml(r.error)}</div>
-      </div>`;
-    }
-    const gi = r.growth_impact || {};
-    return `<div class="debug-card">
-      <h3>${escapeHtml(r.exchange_id)} <span class="stoich">${escapeHtml(r.exchange_name || "")}</span></h3>
-      <dl class="kv">
-        <dt>Exchanged metabolite</dt>
-        <dd>${escapeHtml(r.internal_metabolite.name || r.internal_metabolite.id)} <span class="badge">${escapeHtml(r.internal_metabolite.id)}</span></dd>
-        <dt>Biomass reaction</dt><dd>${escapeHtml(r.biomass_reaction)}</dd>
-        <dt>WT growth</dt><dd>${fmt(gi.wt_growth)}</dd>
-        <dt>Growth after KO</dt>
-        <dd>${fmt(gi.ko_growth)}${gi.ko_growth_fraction == null ? "" : ` (${fmt(gi.ko_growth_fraction * 100, 2)}% of WT)`}</dd>
-      </dl>
-      <div class="debug-compare">
-        <div class="debug-col">
-          <h4>Before KO</h4>
-          ${renderDebugTrace(r.before_ko)}
-        </div>
-        <div class="debug-col">
-          <h4>After KO</h4>
-          ${renderDebugTrace(r.after_ko)}
-        </div>
-      </div>
-    </div>`;
-  }).join("");
-
-  $("debugResults").innerHTML = cards || `<div class="note">No results.</div>`;
-}
-
-function renderDebugTrace(trace) {
-  if (!trace) return `<div class="note">No data.</div>`;
-  if (trace.status !== "success") {
-    return `<div class="note">FBA status: ${escapeHtml(trace.status)}${trace.error ? " — " + escapeHtml(trace.error) : ""}</div>`;
-  }
-  const header = `<div class="stoich">Exchange flux: ${fmt(trace.exchange_flux)} · Biomass flux: ${fmt(trace.biomass_flux)} · Active reactions: ${trace.num_active_reactions}</div>`;
-  if (!trace.paths || !trace.paths.length) {
-    return header + `<div class="note">No active-flux pathway to biomass found.</div>`;
-  }
-  const paths = trace.paths.map((p, i) => {
-    const steps = p.reactions.map((rxn, idx) => {
-      const met = p.metabolites[idx + 1];
-      return `<div class="debug-step">
-        <span class="debug-arrow">↓</span> <span class="badge">${escapeHtml(rxn.id)}</span> flux=${fmt(rxn.flux)}
-        <div class="debug-met">→ ${escapeHtml(met.name || met.id)} <span class="stoich">${escapeHtml(met.id)}</span></div>
-      </div>`;
-    }).join("");
-    return `<div class="debug-path">
-      <div class="debug-path-title">Path ${i + 1}</div>
-      <div class="debug-met">${escapeHtml(p.metabolites[0].name || p.metabolites[0].id)} <span class="stoich">${escapeHtml(p.metabolites[0].id)}</span></div>
-      ${steps}
-    </div>`;
-  }).join("");
-  return header + paths;
-}
-
-// ---------------------------------------------------------------------------
-// Pathway Tracer — a general-purpose module, separate from exchange
-// essentiality/debugging. Traces active-flux paths between ANY starting
-// point (a metabolite, or a reaction resolved to its current-flux products)
-// and ANY target metabolite, for however many BFS "levels" the user asks
-// for. Never runs on its own — the tab renders an empty selection form as
-// soon as the model loads, and nothing is computed until "Run trace" is
-// clicked. Two view modes: a text/words view (same style as the exchange
-// debugger) and an interactive, filterable Cytoscape.js network view.
-// ---------------------------------------------------------------------------
-
-let TRACER_RESULT = null;
-let TRACER_CY = null;
-let TRACER_KO_VIEW = "before";     // "before" | "after" — which snapshot the words/network view renders
-let TRACER_HIGHLIGHT_KO = true;    // whether changed reactions are called out (badge / edge color)
-
-function renderTracer() {
-  const metOptions = (DATA.metabolites || []).map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.name || "")}</option>`).join("");
-  const rxnOptions = (DATA.reactions || []).map(r => `<option value="${escapeHtml(r.id)}">${escapeHtml(r.name || "")}</option>`).join("");
-
-  $("tracer").innerHTML = `
-    <div class="note">
-      Trace active-flux pathways between any starting point and any target metabolite — not tied to biomass or
-      exchanges. Only reactions carrying non-zero flux in the current FBA solution are followed, and common
-      cofactors can be hidden from the trace, same as exchange debugging. Nothing runs automatically — pick a
-      start and target below and click "Run trace".
-    </div>
-    <datalist id="tracerMetList">${metOptions}</datalist>
-    <datalist id="tracerRxnList">${rxnOptions}</datalist>
-    <datalist id="tracerKoList">${metOptions}${rxnOptions}</datalist>
-    <div class="tracer-form">
-      <div class="tracer-field">
-        <label>Start from</label>
-        <select id="tracerStartType">
-          <option value="metabolite">Metabolite</option>
-          <option value="reaction">Reaction</option>
-        </select>
-      </div>
-      <div class="tracer-field tracer-field-wide">
-        <label id="tracerStartLabel">Starting metabolite</label>
-        <input id="tracerStartId" type="text" list="tracerMetList" placeholder="Search metabolite ID or name…">
-      </div>
-      <div class="tracer-field tracer-field-wide">
-        <label>Target metabolite</label>
-        <input id="tracerTargetId" type="text" list="tracerMetList" placeholder="Search metabolite ID or name…">
-      </div>
-      <div class="tracer-field">
-        <label>Max levels</label>
-        <input id="tracerMaxLevels" type="number" min="1" max="100" value="15">
-      </div>
-      <div class="tracer-field">
-        <label>Max paths</label>
-        <input id="tracerMaxPaths" type="number" min="1" max="100" value="10">
-      </div>
-      <div class="tracer-field">
-        <label>&nbsp;</label>
-        <label class="debug-toggle tracer-inline-toggle">
-          <input type="checkbox" id="tracerHideTrivial" checked>
-          Hide common cofactors
-        </label>
-      </div>
-      <div class="tracer-field">
-        <label>View as</label>
-        <div class="tracer-view-toggle">
-          <label><input type="radio" name="tracerView" value="text" checked> Words</label>
-          <label><input type="radio" name="tracerView" value="network"> Network</label>
-        </div>
-      </div>
-      <div class="tracer-field tracer-field-wide">
-        <label>Compare knockout (optional)</label>
-        <input id="tracerKnockouts" type="text" list="tracerKoList" placeholder="e.g. EX_glc_D_e, atp_c — comma separated">
-      </div>
-      <div class="tracer-field">
-        <label>&nbsp;</label>
-        <button id="tracerRunBtn" type="button">Run trace</button>
-      </div>
-    </div>
-    <div class="tracer-ko-hint stoich">
-      Leave blank for a single trace. List one or more reaction or metabolite ids to also trace the same
-      start → target with them knocked out, so you can toggle before/after and see which reactions in the
-      traced paths changed flux. A reaction is blocked directly; a metabolite is "knocked out" by blocking
-      every reaction it participates in (can be a large effect for a highly-connected metabolite).
-    </div>
-    <div id="tracerStatus" class="debug-status"></div>
-    ${progressBarHtml("tracerProgress")}
-    <div id="tracerResults"></div>
-  `;
-
-  const startTypeSel = $("tracerStartType");
-  startTypeSel.addEventListener("change", () => {
-    const isRxn = startTypeSel.value === "reaction";
-    $("tracerStartLabel").textContent = isRxn ? "Starting reaction" : "Starting metabolite";
-    $("tracerStartId").setAttribute("list", isRxn ? "tracerRxnList" : "tracerMetList");
-    $("tracerStartId").placeholder = isRxn ? "Search reaction ID or name…" : "Search metabolite ID or name…";
-    $("tracerStartId").value = "";
-  });
-
-  $("tracerRunBtn").addEventListener("click", runPathwayTrace);
-  document.querySelectorAll('input[name="tracerView"]').forEach(r => r.addEventListener("change", () => {
-    if (TRACER_RESULT) renderTracerActiveView();
-  }));
-}
-
-async function runPathwayTrace() {
-  const startType = $("tracerStartType").value;
-  const startId = $("tracerStartId").value.trim();
-  const targetId = $("tracerTargetId").value.trim();
-  const maxLevels = parseInt($("tracerMaxLevels").value, 10) || 15;
-  const maxPaths = parseInt($("tracerMaxPaths").value, 10) || 10;
-  const hideTrivial = $("tracerHideTrivial").checked;
-  const knockouts = $("tracerKnockouts").value.split(",").map(s => s.trim()).filter(Boolean);
-
-  if (!startId) { $("tracerStatus").innerHTML = `<span class="error">Choose a starting ${escapeHtml(startType)}.</span>`; return; }
-  if (!targetId) { $("tracerStatus").innerHTML = `<span class="error">Choose a target metabolite.</span>`; return; }
-  if (!MODEL_ID) { $("tracerStatus").innerHTML = `<span class="error">Model session expired — please re-run the initial analysis.</span>`; return; }
-
-  const btn = $("tracerRunBtn");
-  btn.disabled = true;
-  $("tracerStatus").textContent = knockouts.length ? "Tracing pathway and comparing knockout…" : "Tracing pathway…";
-  progressStart("tracerProgress");
-  $("tracerResults").innerHTML = "";
-  hideTooltip();
-  if (TRACER_CY) { TRACER_CY.destroy(); TRACER_CY = null; }
-  TRACER_KO_VIEW = "before";
-  TRACER_HIGHLIGHT_KO = true;
-
-  try {
-    const res = await fetch("/api/trace-pathway", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model_id: MODEL_ID,
-        start_type: startType,
-        start_id: startId,
-        target_metabolite_id: targetId,
-        max_levels: maxLevels,
-        max_paths: maxPaths,
-        exclude_trivial_metabolites: hideTrivial,
-        knockouts,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error || "Pathway trace failed");
-
-    TRACER_RESULT = data;
-    const starts = data.start_metabolites || [];
-    const startLabel = starts.length > 1 ? `${starts.length} starting metabolites` : (starts[0] || {}).id || startId;
-    let statusMsg = `Found ${data.paths.length} path(s) from ${startLabel} to ${data.target_metabolite.id} ` +
-      `(max ${data.max_levels} levels). Active reactions in solution: ${data.num_active_reactions}.`;
-    if (data.knockout) {
-      if (data.knockout.error) {
-        statusMsg += ` Knockout comparison could not run: ${data.knockout.error}`;
-      } else {
-        const gi = data.knockout.growth_impact || {};
-        statusMsg += ` Knockout comparison ready — WT growth ${fmt(gi.wt_growth)} → KO growth ${fmt(gi.ko_growth)}` +
-          `${gi.ko_growth_fraction == null ? "" : ` (${fmt(gi.ko_growth_fraction * 100, 1)}% retained)`}.`;
-      }
-    }
-    $("tracerStatus").textContent = statusMsg;
-    progressDone("tracerProgress");
-    renderTracerResults();
-  } catch (err) {
-    TRACER_RESULT = null;
-    $("tracerStatus").innerHTML = `<span class="error">${escapeHtml(err.message)}</span>`;
-    progressDone("tracerProgress");
-    $("tracerResults").innerHTML = "";
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-function renderTracerResults() {
-  if (!TRACER_RESULT) return;
-  $("tracerResults").innerHTML = `<div id="tracerKoToolbar"></div><div id="tracerViewContent"></div>`;
-  renderTracerKoToolbar();
-  renderTracerActiveView();
-}
-
-// The optional before/after-knockout comparison toolbar: growth-impact
-// summary, a Before KO / After KO toggle, and a "highlight changed
-// reactions" checkbox. Rendered once per trace run — the view toggles
-// below only re-render #tracerViewContent, not this toolbar, so the user's
-// radio/checkbox choices aren't lost while switching Words/Network.
-function renderTracerKoToolbar() {
-  const el = $("tracerKoToolbar");
-  const ko = TRACER_RESULT && TRACER_RESULT.knockout;
-  if (!ko) { el.innerHTML = ""; return; }
-
-  if (ko.error) {
-    el.innerHTML = `<div class="note error">Knockout comparison: ${escapeHtml(ko.error)}</div>`;
-    return;
-  }
-
-  const targetsLabel = (ko.targets || []).map(t => `${escapeHtml(t.id)} (${escapeHtml(t.type)})`).join(", ");
-  const blockedLabel = (ko.blocked_reactions || []).join(", ");
-  const gi = ko.growth_impact || {};
-  const hasAfter = !!(ko.after_ko && !ko.after_ko.error);
-
-  el.innerHTML = `
-    <div class="tracer-ko-toolbar">
-      <div class="tracer-ko-summary">
-        <strong>Knockout comparison:</strong> ${targetsLabel} → blocked reaction(s): <code>${escapeHtml(blockedLabel || "—")}</code>.
-        WT growth ${fmt(gi.wt_growth)} → KO growth ${fmt(gi.ko_growth)}${gi.ko_growth_fraction == null ? "" : ` (${fmt(gi.ko_growth_fraction * 100, 1)}% retained)`}.
-        ${ko.not_found && ko.not_found.length ? `<br><span class="stoich">Not found in model, skipped: ${escapeHtml(ko.not_found.join(", "))}</span>` : ""}
-        ${!hasAfter && ko.after_ko && ko.after_ko.error ? `<br><span class="stoich">After-KO trace: ${escapeHtml(ko.after_ko.error)}</span>` : ""}
-      </div>
-      <div class="tracer-ko-controls">
-        <div class="tracer-view-toggle">
-          <label><input type="radio" name="tracerKoView" value="before" ${TRACER_KO_VIEW === "before" ? "checked" : ""}> Before KO</label>
-          <label><input type="radio" name="tracerKoView" value="after" ${TRACER_KO_VIEW === "after" ? "checked" : ""} ${hasAfter ? "" : "disabled"}> After KO</label>
-        </div>
-        <label class="debug-toggle tracer-inline-toggle">
-          <input type="checkbox" id="tracerHighlightKo" ${TRACER_HIGHLIGHT_KO ? "checked" : ""}>
-          Highlight KO-affected reactions
-        </label>
-      </div>
-    </div>
-  `;
-
-  document.querySelectorAll('input[name="tracerKoView"]').forEach(r => r.addEventListener("change", ev => {
-    TRACER_KO_VIEW = ev.target.value;
-    renderTracerActiveView();
-  }));
-  const highlightCb = $("tracerHighlightKo");
-  if (highlightCb) highlightCb.addEventListener("change", () => {
-    TRACER_HIGHLIGHT_KO = highlightCb.checked;
-    renderTracerActiveView();
-  });
-}
-
-// The paths currently on display: the baseline ("before KO") trace, or —
-// when the toggle is set to "after" and an after-KO trace actually
-// succeeded — the after-KO trace's paths instead. Everything else
-// (target metabolite, start type/id) is shared between the two, so only
-// "paths" and "start_metabolites" need swapping.
-function getActiveTracerData() {
-  const base = TRACER_RESULT;
-  const ko = base && base.knockout;
-  if (TRACER_KO_VIEW === "after" && ko && !ko.error && ko.after_ko && !ko.after_ko.error) {
-    return Object.assign({}, base, {
-      paths: ko.after_ko.paths,
-      start_metabolites: ko.after_ko.start_metabolites || base.start_metabolites,
-    });
-  }
-  return base;
-}
-
-function renderTracerActiveView() {
-  const view = (document.querySelector('input[name="tracerView"]:checked') || {}).value || "text";
-  hideTooltip();
-  if (TRACER_CY) { TRACER_CY.destroy(); TRACER_CY = null; }
-  const data = getActiveTracerData();
-  if (view === "network") {
-    renderTracerNetworkView(data);
-  } else {
-    renderTracerTextView(data);
-  }
-}
-
-// Per-reaction before/after-KO summary, used by both the words view (as an
-// inline badge) and the network view (as an edge color class). Returns null
-// when there's no knockout comparison, highlighting is off, or this
-// reaction isn't one of the ones the comparison tracked.
-function tracerFluxDelta(rxnId) {
-  if (!TRACER_HIGHLIGHT_KO) return null;
-  const ko = TRACER_RESULT && TRACER_RESULT.knockout;
-  if (!ko || ko.error || !ko.flux_comparison) return null;
-  return ko.flux_comparison[rxnId] || null;
-}
-
-function fluxDeltaBadge(rxnId) {
-  const fc = tracerFluxDelta(rxnId);
-  if (!fc) return "";
-  if (fc.active_before && !fc.active_after) {
-    return `<span class="badge bad">KO: blocked (${fmt(fc.before_flux)} → 0)</span>`;
-  }
-  if (!fc.active_before && fc.active_after) {
-    return `<span class="badge good">KO: new route (0 → ${fmt(fc.after_flux)})</span>`;
-  }
-  if (Math.abs(fc.after_flux - fc.before_flux) > 1e-6) {
-    return `<span class="badge">KO: ${fmt(fc.before_flux)} → ${fmt(fc.after_flux)}</span>`;
-  }
-  return `<span class="badge good">KO: unaffected</span>`;
-}
-
-function fluxDeltaClass(rxnId) {
-  const fc = tracerFluxDelta(rxnId);
-  if (!fc) return "";
-  if (fc.active_before && !fc.active_after) return "ko-removed";
-  if (!fc.active_before && fc.active_after) return "ko-added";
-  if (Math.abs(fc.after_flux - fc.before_flux) > 1e-6) return "ko-changed";
-  return "";
-}
-
-function renderTracerTextView(data) {
-  if (!data.paths || !data.paths.length) {
-    $("tracerViewContent").innerHTML = `<div class="note">No active-flux pathway found from ${escapeHtml(data.start_id)} to ${escapeHtml(data.target_metabolite.id)} ${TRACER_KO_VIEW === "after" ? "(after knockout)" : ""}.</div>`;
-    return;
-  }
-  const paths = data.paths.map((p, i) => {
-    const steps = p.reactions.map((rxn, idx) => {
-      const met = p.metabolites[idx + 1];
-      return `<div class="debug-step">
-        <span class="debug-arrow">↓</span> <span class="badge">${escapeHtml(rxn.id)}</span> flux=${fmt(rxn.flux)}
-        ${rxn.subsystem ? `<span class="stoich"> · ${escapeHtml(rxn.subsystem)}</span>` : ""}
-        ${fluxDeltaBadge(rxn.id)}
-        <div class="debug-met">→ ${escapeHtml(met.name || met.id)} <span class="stoich">${escapeHtml(met.id)}</span></div>
-      </div>`;
-    }).join("");
-    return `<div class="debug-path">
-      <div class="debug-path-title">Path ${i + 1}</div>
-      <div class="debug-met">${escapeHtml(p.metabolites[0].name || p.metabolites[0].id)} <span class="stoich">${escapeHtml(p.metabolites[0].id)}</span></div>
-      ${steps}
-    </div>`;
-  }).join("");
-  $("tracerViewContent").innerHTML = `<div class="debug-col tracer-text-col">${paths}</div>`;
-}
-
-function renderTracerNetworkView(data) {
-  const showKoLegend = TRACER_HIGHLIGHT_KO && TRACER_RESULT && TRACER_RESULT.knockout && !TRACER_RESULT.knockout.error;
-  $("tracerViewContent").innerHTML = `
-    <div class="tracer-network-toolbar">
-      <select id="tracerFilterSubsystem"><option value="">All subsystems</option></select>
-      <label class="tracer-flux-filter">Min |flux| <input id="tracerFilterFlux" type="number" min="0" step="0.01" value="0"></label>
-      <input id="tracerFilterSearch" type="text" placeholder="Highlight metabolite or reaction…">
-      <span id="tracerNetCount" class="stoich"></span>
-    </div>
-    <div id="tracerCyContainer" class="tracer-cy-container"></div>
-    <div class="tracer-legend">
-      <span><i class="tracer-dot tracer-dot-start"></i> Start</span>
-      <span><i class="tracer-dot tracer-dot-target"></i> Target</span>
-      <span><i class="tracer-dot tracer-dot-mid"></i> Intermediate</span>
-      ${showKoLegend ? `
-        <span><i class="tracer-dot tracer-dot-ko-removed"></i> Removed by KO</span>
-        <span><i class="tracer-dot tracer-dot-ko-added"></i> New route after KO</span>
-        <span><i class="tracer-dot tracer-dot-ko-changed"></i> Flux changed</span>
-      ` : ""}
-      <span class="stoich">Hover a metabolite or reaction for details.</span>
-    </div>
-  `;
-
-  if (!data.paths || !data.paths.length) {
-    $("tracerCyContainer").innerHTML = `<div class="note">No active-flux pathway found from ${escapeHtml(data.start_id)} to ${escapeHtml(data.target_metabolite.id)} ${TRACER_KO_VIEW === "after" ? "(after knockout)" : ""}.</div>`;
-    document.querySelectorAll(".tracer-network-toolbar select, .tracer-network-toolbar input").forEach(el => el.disabled = true);
-    return;
-  }
-
-  const startIds = new Set((data.start_metabolites || []).map(m => m.id));
-  const targetId = data.target_metabolite.id;
-
-  const nodesById = new Map();
-  const edges = [];
-  const subsystems = new Set();
-
-  data.paths.forEach((p, pathIdx) => {
-    // Keep the full metabolite/reaction record from the API response (id,
-    // name, compartment, formula, charge, reaction string, bounds, GPR,
-    // type…) so the hover tooltip below has everything it needs without a
-    // second request — the network view is just a different rendering of
-    // the same data the text view already gets.
-    p.metabolites.forEach(m => {
-      if (!nodesById.has(m.id)) nodesById.set(m.id, m);
-    });
-    p.reactions.forEach((rxn, idx) => {
-      const source = p.metabolites[idx].id;
-      const target = p.metabolites[idx + 1].id;
-      if (rxn.subsystem) subsystems.add(rxn.subsystem);
-      edges.push(Object.assign({}, rxn, {
-        id: `e_${pathIdx}_${idx}`,
-        source, target,
-        rxnId: rxn.id, rxnName: rxn.name || "",
-        koClass: fluxDeltaClass(rxn.id),
-      }));
-    });
-  });
-
-  const elements = [];
-  nodesById.forEach(n => {
-    let role = "intermediate";
-    if (startIds.has(n.id)) role = "start";
-    if (n.id === targetId) role = "target";
-    elements.push({ data: Object.assign({}, n, { label: n.name || n.id }), classes: role });
-  });
-  edges.forEach(e => {
-    elements.push({
-      data: Object.assign({}, e, {
-        label: e.rxnId,
-        flux: Math.abs(e.flux),
-        rawFlux: e.flux,
-      }),
-      classes: e.koClass || "",
-    });
-  });
-
-  const subsystemSelect = $("tracerFilterSubsystem");
-  [...subsystems].sort().forEach(s => {
-    const opt = document.createElement("option");
-    opt.value = s; opt.textContent = s;
-    subsystemSelect.appendChild(opt);
-  });
-
-  TRACER_CY = cytoscape({
-    container: $("tracerCyContainer"),
-    elements,
-    style: [
-      { selector: "node", style: {
-        "label": "data(label)", "font-size": 9, "text-valign": "bottom", "text-margin-y": 4,
-        "text-wrap": "ellipsis", "text-max-width": "70px",
-        "width": 26, "height": 26, "background-color": "#94a3b8", "border-width": 2, "border-color": "#64748b",
-      }},
-      { selector: "node.start", style: { "background-color": "#2563eb", "border-color": "#1e40af", "width": 32, "height": 32 } },
-      { selector: "node.target", style: { "background-color": "#047857", "border-color": "#065f46", "width": 32, "height": 32 } },
-      { selector: "node.tracer-dimmed", style: { "opacity": 0.15 } },
-      { selector: "node.tracer-highlighted", style: { "border-color": "#f59e0b", "border-width": 4 } },
-      { selector: "edge", style: {
-        "width": "mapData(flux, 0, 20, 1.5, 7)", "line-color": "#94a3b8", "target-arrow-color": "#94a3b8",
-        "target-arrow-shape": "triangle", "curve-style": "bezier", "label": "data(label)",
-        "font-size": 8, "color": "#475569", "text-background-color": "#ffffff", "text-background-opacity": 0.85,
-        "text-rotation": "autorotate",
-      }},
-      { selector: "edge.tracer-dimmed", style: { "opacity": 0.08 } },
-      { selector: "edge.tracer-highlighted", style: { "line-color": "#f59e0b", "target-arrow-color": "#f59e0b", "width": 4 } },
-      // Before/after-knockout comparison overlay (see fluxDeltaClass) —
-      // only applied to edges when a knockout was traced and "Highlight
-      // KO-affected reactions" is checked.
-      { selector: "edge.ko-removed", style: { "line-color": "#dc2626", "target-arrow-color": "#dc2626", "line-style": "dashed", "width": 3 } },
-      { selector: "edge.ko-added", style: { "line-color": "#16a34a", "target-arrow-color": "#16a34a", "width": 4 } },
-      { selector: "edge.ko-changed", style: { "line-color": "#d97706", "target-arrow-color": "#d97706", "width": 4 } },
-      { selector: ".tracer-hidden", style: { "display": "none" } },
-    ],
-    layout: { name: "breadthfirst", roots: [...startIds], directed: true, spacingFactor: 1.25, padding: 24 },
-    wheelSensitivity: 0.25,
-  });
-
-  attachTracerNetworkTooltips(TRACER_CY);
-
-  $("tracerNetCount").textContent = `${nodesById.size} metabolites · ${edges.length} reaction hops`;
-
-  const applyFilters = () => {
-    const subVal = subsystemSelect.value;
-    const fluxMin = parseFloat($("tracerFilterFlux").value) || 0;
-    const search = $("tracerFilterSearch").value.trim().toLowerCase();
-
-    TRACER_CY.edges().forEach(e => {
-      const passSub = !subVal || e.data("subsystem") === subVal;
-      const passFlux = e.data("flux") >= fluxMin;
-      e.toggleClass("tracer-hidden", !(passSub && passFlux));
-    });
-    TRACER_CY.nodes().forEach(n => {
-      const visibleEdges = n.connectedEdges().filter(e => !e.hasClass("tracer-hidden"));
-      const isEndpoint = startIds.has(n.id()) || n.id() === targetId;
-      n.toggleClass("tracer-hidden", !(visibleEdges.length > 0 || isEndpoint));
-    });
-
-    TRACER_CY.elements().removeClass("tracer-highlighted tracer-dimmed");
-    if (search) {
-      const visible = TRACER_CY.elements().not(".tracer-hidden");
-      const matches = visible.filter(el =>
-        (el.data("label") || "").toLowerCase().includes(search) ||
-        (el.data("rxnName") || "").toLowerCase().includes(search) ||
-        (el.id() || "").toLowerCase().includes(search)
-      );
-      if (matches.length) {
-        visible.addClass("tracer-dimmed");
-        matches.removeClass("tracer-dimmed").addClass("tracer-highlighted");
-      }
-    }
-  };
-
-  subsystemSelect.addEventListener("change", applyFilters);
-  $("tracerFilterFlux").addEventListener("input", applyFilters);
-  $("tracerFilterSearch").addEventListener("input", applyFilters);
-  if (!subsystems.size) subsystemSelect.disabled = true;
-}
-
-// Hover tooltip content for a network node (metabolite) / edge (reaction) —
-// reuses the same fixed-position tooltip element as the exchange table
-// (ensureTooltip/showTooltip/positionTooltip/hideTooltip above).
-function buildTracerNodeTooltipHtml(d) {
-  return `
-    <div class="tooltip-title">${escapeHtml(d.name || d.id)}</div>
-    <div class="tooltip-row"><span class="tooltip-label">ID</span><code>${escapeHtml(d.id)}</code></div>
-    <div class="tooltip-row"><span class="tooltip-label">Compartment</span>${escapeHtml(d.compartment_name || d.compartment || "—")}${d.compartment ? ` <span class="stoich">(${escapeHtml(d.compartment)})</span>` : ""}</div>
-    <div class="tooltip-row"><span class="tooltip-label">Formula</span>${escapeHtml(d.formula || "—")}</div>
-    <div class="tooltip-row"><span class="tooltip-label">Charge</span>${d.charge === null || d.charge === undefined ? "—" : d.charge}</div>
-  `;
-}
-
-function buildTracerEdgeTooltipHtml(d) {
-  return `
-    <div class="tooltip-title">${escapeHtml(d.rxnId)}${d.rxnName ? ` — ${escapeHtml(d.rxnName)}` : ""}</div>
-    <div class="tooltip-row"><span class="tooltip-label">Reaction</span><code>${escapeHtml(d.reaction_string || "—")}</code></div>
-    <div class="tooltip-row"><span class="tooltip-label">Subsystem</span>${escapeHtml(d.subsystem || "—")}</div>
-    <div class="tooltip-row"><span class="tooltip-label">Type</span>${escapeHtml(d.type || "—")}</div>
-    <div class="tooltip-row"><span class="tooltip-label">GPR</span>${escapeHtml(d.gene_reaction_rule || "—")}</div>
-    <div class="tooltip-row"><span class="tooltip-label">Bounds</span>[${fmt(d.lower_bound, 2)}, ${fmt(d.upper_bound, 2)}]</div>
-    <div class="tooltip-row"><span class="tooltip-label">Flux (this trace)</span>${fmt(d.rawFlux)}</div>
-  `;
-}
-
-function attachTracerNetworkTooltips(cy) {
-  const showFor = (ev, buildHtml) => {
-    const orig = ev.originalEvent;
-    const x = orig ? orig.clientX : 0;
-    const y = orig ? orig.clientY : 0;
-    showTooltip(buildHtml(ev.target.data()), x, y);
-  };
-  cy.on("mouseover", "node", ev => showFor(ev, buildTracerNodeTooltipHtml));
-  cy.on("mouseover", "edge", ev => showFor(ev, buildTracerEdgeTooltipHtml));
-  cy.on("mousemove", "node, edge", ev => {
-    const orig = ev.originalEvent;
-    if (orig) positionTooltip(orig.clientX, orig.clientY);
-  });
-  cy.on("mouseout", "node, edge", () => hideTooltip());
-  cy.on("pan zoom drag", () => hideTooltip());
-  // cy's own "mouseout" only fires when the pointer moves off an element
-  // while still inside the container; a mouse move that jumps straight from
-  // a node/edge to somewhere else on the page never reaches cytoscape at
-  // all, so the tooltip needs its own listener on the container itself.
-  const container = cy.container();
-  if (container) container.addEventListener("mouseleave", () => hideTooltip());
-}
-
-// ---------------------------------------------------------------------------
 // Shared "save this generated HTML report" helpers -- used by both the FROG
 // tab's own "save as HTML" button and the multi-section Generate Report
 // modal below. Saving to an arbitrary path only works because this Flask
@@ -2447,6 +1818,18 @@ function reportDocumentHtml(title, bodyHtml) {
     --bg:#f1f4f9; --card-bg:#ffffff; --border:#e2e8f0; --border-soft:#edf1f7;
     --text:#0f172a; --muted:#64748b; --muted-soft:#94a3b8;
     --good:#16a34a; --bad:#dc2626; --warn:#b45309;
+    --th-bg:#f8fafc; --row-alt:#fbfcfe; --card-alt:#fbfcfe; --note-bg:#fffbeb; --note-bd:#fde68a; --note-fg:#854d0e; --code-bg:rgba(15,23,42,.06);
+    --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300; --s-other:#8f8e88; --grid:#e3e2de;
+    color-scheme:light;
+  }
+  [data-theme="dark"] {
+    --accent:#6ea0ff; --accent-dark:#3b6fd4; --accent-soft:#222c4a;
+    --bg:#111622; --card-bg:#1a2133; --border:#2c3652; --border-soft:#252e46;
+    --text:#e8ebf3; --muted:#a6b0c6; --muted-soft:#7e8aa5;
+    --good:#3fbf8a; --bad:#f2766b; --warn:#e0a040;
+    --th-bg:#202941; --row-alt:#1e2638; --card-alt:#1e2638; --note-bg:#2a2414; --note-bd:#5c4a17; --note-fg:#f0d28a; --code-bg:rgba(255,255,255,.08);
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#2aa02a; --s-other:#8f8e88; --grid:#34332f;
+    color-scheme:dark;
   }
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; background:var(--bg); color:var(--text); }
@@ -2490,30 +1873,44 @@ function reportDocumentHtml(title, bodyHtml) {
   }
   h3 { font-size:13px; margin:18px 0 8px; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; }
   .report-meta { color:var(--muted); font-size:13px; margin-bottom:4px; }
-  .report-note { padding:10px 13px; background:#fffbeb; border:1px solid #fde68a; border-left:3px solid var(--warn); border-radius:8px; color:#854d0e; margin-bottom:14px; font-size:12.5px; }
+  .report-note { padding:10px 13px; background:var(--note-bg); border:1px solid var(--note-bd); border-left:3px solid var(--warn); border-radius:8px; color:var(--note-fg); margin-bottom:14px; font-size:12.5px; }
   .report-note ul { margin:6px 0 0 18px; padding:0; }
   .report-note li { margin-bottom:4px; }
-  code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:rgba(15,23,42,.06); border-radius:4px; padding:1px 4px; font-size:11.5px; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--code-bg); border-radius:4px; padding:1px 4px; font-size:11.5px; }
 
   .objective-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; margin-bottom:14px; }
-  .objective-card { border:1px solid var(--border); border-radius:12px; padding:14px 16px; background:#fbfcfe; }
+  .objective-card { border:1px solid var(--border); border-radius:12px; padding:14px 16px; background:var(--card-alt); }
   .objective-card .mini-stat-label { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); font-weight:700; }
   .reaction-expr { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; line-height:1.5; word-break:break-word; margin-top:6px; }
   .biomass-details { border:1px solid var(--border); border-radius:12px; margin-bottom:14px; overflow:hidden; }
-  .biomass-details summary { cursor:pointer; padding:10px 14px; font-weight:700; font-size:13px; background:#f8fafc; }
+  .biomass-details summary { cursor:pointer; padding:10px 14px; font-weight:700; font-size:13px; background:var(--th-bg); }
   .biomass-details .biomass-body { padding:4px 16px 14px; margin:0; }
   .stoich { color:var(--muted); font-size:11.5px; margin-top:4px; }
 
   table { width:100%; border-collapse:collapse; font-size:12.5px; margin-bottom:8px; }
   th, td { padding:8px 10px; border-bottom:1px solid var(--border-soft); text-align:left; vertical-align:top; }
-  th { background:#f8fafc; position:sticky; top:0; font-weight:700; color:#334155; white-space:nowrap; }
-  tbody tr:nth-child(even) { background:#fbfcfe; }
+  th { background:var(--th-bg); position:sticky; top:0; font-weight:700; color:var(--text); white-space:nowrap; }
+  tbody tr:nth-child(even) { background:var(--row-alt); }
   tbody tr:hover { background:var(--accent-soft); }
   .table-scroll { max-height:560px; overflow:auto; border:1px solid var(--border-soft); border-radius:10px; margin-bottom:18px; }
 
   .report-footer { text-align:center; color:var(--muted-soft); font-size:11.5px; padding:24px 0 4px; border-top:1px solid var(--border-soft); margin-top:8px; }
 
+  .report-toggle { position:fixed; top:12px; right:14px; z-index:5; border:1px solid var(--border); background:var(--card-bg); color:var(--text); border-radius:999px; padding:5px 12px; font-size:12px; cursor:pointer; }
+  .rc-figure { margin:14px 0 18px; }
+  .rc-figure figcaption { font-size:13px; font-weight:700; margin-bottom:6px; color:var(--text); }
+  .rc-svg { width:100%; max-width:760px; height:auto; display:block; }
+  .rc-t { fill:var(--muted); font:12px -apple-system,"Segoe UI",Inter,sans-serif; }
+  .rc-v { fill:var(--text); font-weight:600; }
+  .rc-axis, .rc-grid { stroke:var(--grid); stroke-width:1; }
+  .rc-legend { display:flex; flex-wrap:wrap; gap:4px 16px; margin-top:6px; font-size:12px; color:var(--muted); }
+  .rc-legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .rc-note { color:var(--muted); font-size:12px; margin-top:2px; }
+  .rc-grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:6px 24px; }
+  .finding-list { margin:6px 0 14px 18px; padding:0; }
+  .finding-list li { margin-bottom:5px; }
   @media print {
+    .report-toggle { display:none; }
     body { background:#fff; }
     .report-cover { border-radius:0; margin:0 0 20px; }
     .report-section { box-shadow:none; break-inside:avoid-page; }
@@ -2523,6 +1920,7 @@ function reportDocumentHtml(title, bodyHtml) {
 </style>
 </head>
 <body>
+<button class="report-toggle" type="button" onclick="var r=document.documentElement;r.dataset.theme=r.dataset.theme==='dark'?'light':'dark';this.textContent=r.dataset.theme==='dark'?'Light theme':'Dark theme'">Dark theme</button>
 <div class="report-wrap">
 ${bodyHtml}
 <div class="report-footer">Generated by the Genome-scale Model Inspector — ${escapeHtml(new Date().toLocaleString())}</div>
@@ -2679,15 +2077,20 @@ function sanitizeForFilename(name) {
 // ---------------------------------------------------------------------------
 
 let FROG_RESULT = null;
+let FROG_PARAMS = null; // query string FROG_RESULT was computed with; the report reuses it when identical
 let CURRENT_FROG_EVENTSOURCE = null;
 
 const FROG_FVA_CSV_COLUMNS = [
   { key: "id", label: "Reaction ID" },
+  { key: "lower_bound", label: "LB" },
+  { key: "upper_bound", label: "UB" },
   { key: "minimum", label: "Minimum flux" },
   { key: "maximum", label: "Maximum flux" },
 ];
 const FROG_REACTION_DELETION_CSV_COLUMNS = [
   { key: "id", label: "Reaction ID" },
+  { key: "lower_bound", label: "LB" },
+  { key: "upper_bound", label: "UB" },
   { key: "growth", label: "Growth after knockout" },
   { key: "status", label: "Solver status" },
 ];
@@ -2753,6 +2156,7 @@ function runFrogReport() {
   progressStart("frogProgress");
   $("frogResults").innerHTML = "";
   FROG_RESULT = null;
+  FROG_PARAMS = null;
 
   const modelId = MODEL_ID;
   const params = new URLSearchParams({
@@ -2761,7 +2165,8 @@ function runFrogReport() {
     include_reaction_deletions: includeRxnDel ? "1" : "0",
     include_gene_deletions: includeGeneDel ? "1" : "0",
   });
-  const eventSource = new EventSource(`/api/frog-report/${modelId}?${params.toString()}`);
+  const paramsKey = params.toString();
+  const eventSource = new EventSource(`/api/frog-report/${modelId}?${paramsKey}`);
   CURRENT_FROG_EVENTSOURCE = eventSource;
 
   eventSource.onmessage = (event) => {
@@ -2779,6 +2184,7 @@ function runFrogReport() {
       if (CURRENT_FROG_EVENTSOURCE === eventSource) CURRENT_FROG_EVENTSOURCE = null;
     } else if (msg.type === "complete") {
       FROG_RESULT = msg;
+      FROG_PARAMS = paramsKey;
       $("frogStatus").textContent = msg.note || "Done.";
       progressDone("frogProgress");
       renderFrogResults(msg);
@@ -2800,7 +2206,14 @@ function runFrogReport() {
   };
 }
 
+// The model's own bounds next to each reaction, taken from the Reactions table.
+function addReactionBounds(rows) {
+  (rows || []).forEach(r => { const x = entityRow("rxn", r.id); if (x) { r.lower_bound = x.lower_bound; r.upper_bound = x.upper_bound; } });
+}
+
 function renderFrogResults(data) {
+  addReactionBounds(data.fva && data.fva.reactions);
+  addReactionBounds(data.reaction_deletions && data.reaction_deletions.reactions);
   const obj = data.objective || {};
   $("frogResults").innerHTML = `
     <div class="frog-obj-card">
@@ -2852,8 +2265,8 @@ function renderFrogFvaTable(rows) {
   wrap.innerHTML = `
     <div class="toolbar"></div>
     <div class="table-wrap"><table id="frogFvaTable">
-      <thead><tr><th data-key="id">Reaction ID</th><th data-key="minimum">Minimum flux</th><th data-key="maximum">Maximum flux</th></tr></thead>
-      <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.minimum, 6)}</td><td class="num">${fmt(r.maximum, 6)}</td></tr>`).join("")}</tbody>
+      <thead><tr><th data-key="id">Reaction ID</th><th data-key="lower_bound">LB</th><th data-key="upper_bound">UB</th><th data-key="minimum">Minimum flux</th><th data-key="maximum">Maximum flux</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.lower_bound, 2)}</td><td class="num">${fmt(r.upper_bound, 2)}</td><td class="num">${fmt(r.minimum, 6)}</td><td class="num">${fmt(r.maximum, 6)}</td></tr>`).join("")}</tbody>
     </table></div>
   `;
   attachTableTools("frogFvaTable", wrap.querySelector(".toolbar"), FROG_FVA_CSV_COLUMNS, () => frogFvaCurrentRows, "frog_fva");
@@ -2868,8 +2281,8 @@ function renderFrogReactionDeletionTable(rows) {
   wrap.innerHTML = `
     <div class="toolbar"></div>
     <div class="table-wrap"><table id="frogRxnDelTable">
-      <thead><tr><th data-key="id">Reaction ID</th><th data-key="growth">Growth after knockout</th><th data-key="status">Status</th></tr></thead>
-      <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.growth, 6)}</td><td>${escapeHtml(r.status)}</td></tr>`).join("")}</tbody>
+      <thead><tr><th data-key="id">Reaction ID</th><th data-key="lower_bound">LB</th><th data-key="upper_bound">UB</th><th data-key="growth">Growth after knockout</th><th data-key="status">Status</th></tr></thead>
+      <tbody>${rows.map(r => `<tr><td><strong>${escapeHtml(r.id)}</strong></td><td class="num">${fmt(r.lower_bound, 2)}</td><td class="num">${fmt(r.upper_bound, 2)}</td><td class="num">${fmt(r.growth, 6)}</td><td>${escapeHtml(r.status)}</td></tr>`).join("")}</tbody>
     </table></div>
   `;
   attachTableTools("frogRxnDelTable", wrap.querySelector(".toolbar"), FROG_REACTION_DELETION_CSV_COLUMNS, () => frogRxnDelCurrentRows, "frog_reaction_deletions");
@@ -2910,10 +2323,14 @@ function buildFrogSectionBody(data) {
       ? `<div class="report-meta">Fraction of optimum: ${fmt(data.fva.fraction_of_optimum, 4)}</div>${staticTableHtml(FROG_FVA_CSV_COLUMNS, data.fva.reactions, { emptyMessage: "No reactions." })}`
       : `<div class="report-note">Not included in this run.</div>`}
     <h3>Reaction deletions (R)</h3>
+    ${data.reaction_deletions ? reportStatusStack(data.reaction_deletions.reactions, "status", "Reaction deletions by solver status") +
+      rcHist(data.reaction_deletions.reactions.map(r => r.growth), { title: "Growth after deleting each reaction", xLabel: "objective value", bins: 20 }) : ""}
     ${data.reaction_deletions
       ? staticTableHtml(FROG_REACTION_DELETION_CSV_COLUMNS, data.reaction_deletions.reactions, { emptyMessage: "No reactions." })
       : `<div class="report-note">Not included in this run.</div>`}
     <h3>Gene deletions (G)</h3>
+    ${data.gene_deletions ? reportStatusStack(data.gene_deletions.genes, "status", "Gene deletions by solver status") +
+      rcHist(data.gene_deletions.genes.map(g => g.growth), { title: "Growth after deleting each gene", xLabel: "objective value", bins: 20 }) : ""}
     ${data.gene_deletions
       ? staticTableHtml(FROG_GENE_DELETION_CSV_COLUMNS, data.gene_deletions.genes, { emptyMessage: "No genes." })
       : `<div class="report-note">Not included in this run.</div>`}
@@ -2947,11 +2364,14 @@ function buildFrogReportHtml(data) {
 // ---------------------------------------------------------------------------
 
 const REPORT_SECTIONS = [
-  { key: "overview", title: "Overview", hint: "Model stats, compartments, and the diet/media summary." },
-  { key: "metabolites", title: "Metabolites", hint: "The full metabolite table." },
-  { key: "reactions", title: "Reactions", hint: "The full reaction table." },
+  { key: "quality", title: "Quality findings", hint: "Key statistics and automatic findings against the thresholds below." },
+  { key: "overview", title: "Overview", hint: "Model stats, compartments and the diet/media summary, with charts." },
+  { key: "metabolites", title: "Metabolites", hint: "The full metabolite table, with a formula-coverage chart." },
+  { key: "reactions", title: "Reactions", hint: "The full reaction table, with reaction-type and subsystem charts." },
+  { key: "genes", title: "Genes", hint: "Every gene with its reactions, with charts." },
   { key: "objective", title: "Objective", hint: "Objective metabolites and their coefficients." },
-  { key: "exchanges", title: "Exchange essentiality", hint: "Every exchange, tested for knockout essentiality." },
+  { key: "exchanges", title: "Exchange essentiality", hint: "Every exchange, tested for knockout essentiality, with a chart." },
+  { key: "balance", title: "Reaction balance", hint: "Mass/charge balance status and the problem reactions." },
   { key: "minimal_medium", title: "Minimal medium", hint: "Smallest nutrient set for a chosen growth cutoff.", cutoff: true },
   { key: "network_gaps", title: "Network gaps (blocked reactions & dead ends)", hint: "Structural connectivity gaps under the model's current bounds." },
   { key: "demand_sink_audit", title: "Demand & sink audit", hint: "Every demand/sink reaction's usage and knockout essentiality." },
@@ -2981,10 +2401,19 @@ function renderReportModal() {
         </div>
         <div class="modal-body">
           <div class="note">
-            Pick which sections to include and, for the ones that need it, a cutoff. Each section is recomputed
-            fresh with the settings below — independent of whatever's currently shown in the tabs — then assembled
-            into one self-contained HTML file.
+            Pick the sections to include. Analyses you have already run in the tabs are reused rather than repeated;
+            the rest are computed now. The result is one self-contained HTML report with charts (light or dark, switchable
+            in the page), and optionally an Excel workbook of the key statistics and findings.
           </div>
+          <details class="report-options" id="reportThresholds">
+            <summary>Quality thresholds and Excel</summary>
+            <div class="toolbar">
+              ${thresholdInputHtml("mu_min", "Growth rate min (1/h)")} ${thresholdInputHtml("mu_max", "max (1/h)")}
+              ${thresholdInputHtml("blocked_warn_pct", "Warn if blocked reactions &gt; %")} ${thresholdInputHtml("deadend_warn_pct", "dead-end metabolites &gt; %")}
+            </div>
+            <div class="toolbar"><label><input type="checkbox" id="reportExcel"> Also download the Excel workbook</label></div>
+            <div class="stoich">The same thresholds appear on the Summary and Network Gaps tabs and stay in sync.</div>
+          </details>
           <div id="reportSectionList"></div>
           <div id="reportSavePath" style="margin-top:18px;"></div>
         </div>
@@ -3031,6 +2460,7 @@ function renderReportModal() {
     `;
   }).join("");
 
+  bindThresholdInputs($("reportThresholds"));
   const getPath = attachSavePathPicker($("reportSavePath"), "reportSavePath", reportDefaultFilename());
   $("reportGenerateBtn").addEventListener("click", () => runGenerateReport(getPath));
 }
@@ -3096,6 +2526,23 @@ function reportUnmappedWarningHtml(kind, limit) {
   `;
 }
 
+const BALANCE_COLORS = { balanced: "var(--good)", unbalanced: "var(--bad)", unknown: "var(--warn)", "n/a": "var(--s-other)" };
+
+function reportStatusStack(rows, key, title, colors) {
+  const counts = {};
+  rows.forEach(r => { counts[r[key]] = (counts[r[key]] || 0) + 1; });
+  const order = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  return rcStack(order.map((k, i) => ({ label: k, value: counts[k], color: (colors && colors[k]) || RC_SERIES[i % RC_SERIES.length] })), { title });
+}
+
+function reportOverviewCharts() {
+  const rxnTypes = reportStatusStack(DATA.reactions, "type", "Reactions by type");
+  const bal = reportStatusStack(DATA.reactions, "balance", "Reaction balance status", BALANCE_COLORS);
+  const comps = rcBars(rcCountBy(DATA.metabolites, m => COMP_NAMES[m.compartment] || m.compartment, 8), { title: "Metabolites per compartment" });
+  const subs = rcBars(rcCountBy(DATA.reactions.filter(r => r.subsystem), r => r.subsystem, 12), { title: "Reactions per subsystem (top 12)" });
+  return `${rxnTypes}${bal}<div class="rc-grid2">${comps}${subs}</div>`;
+}
+
 function reportOverviewSectionHtml() {
   const s = DATA.stats;
   const d = DATA.diet;
@@ -3115,6 +2562,7 @@ function reportOverviewSectionHtml() {
     <h2 id="sec-overview">Overview</h2>
     ${staticTableHtml([{ key: "k", label: "Field" }, { key: "v", label: "Value" }], rows)}
     ${dietNote}
+    ${reportOverviewCharts()}
     </section>
   `;
 }
@@ -3128,6 +2576,8 @@ function reportMetabolitesSectionHtml() {
     <section class="report-section">
     <h2 id="sec-metabolites">Metabolites</h2>
     ${reportUnmappedWarningHtml("metabolite", 200)}
+    ${reportStatusStack(DATA.metabolites.map(m => ({ f: (m.formula || "").trim() ? "formula present" : "formula missing" })), "f", "Metabolites with a chemical formula", { "formula present": "var(--s1)", "formula missing": "var(--warn)" })}
+    ${rcHist(DATA.metabolites.map(m => m.reaction_count || 0), { title: "Reactions per metabolite", xLabel: "number of reactions", bins: 20 })}
     ${staticTableHtml(METABOLITE_TABLE_COLUMNS, DATA.metabolites, { emptyMessage: "No metabolites." })}
     </section>
   `;
@@ -3138,7 +2588,53 @@ function reportReactionsSectionHtml() {
     <section class="report-section">
     <h2 id="sec-reactions">Reactions</h2>
     ${reportUnmappedWarningHtml("reaction", 200)}
+    ${reportStatusStack(DATA.reactions, "type", "Reactions by type")}
+    ${reportStatusStack(DATA.reactions.map(r => ({ f: Math.abs(r.wt_flux || 0) > 1e-9 ? "carries flux (WT)" : "no flux (WT)" })), "f", "Reactions carrying flux in the wild-type solution", { "carries flux (WT)": "var(--s1)", "no flux (WT)": "var(--s-other)" })}
+    ${rcBars(rcCountBy(DATA.reactions.filter(r => r.subsystem), r => r.subsystem, 15), { title: "Reactions per subsystem (top 15)" })}
     ${staticTableHtml(REACTION_TABLE_COLUMNS, DATA.reactions, { emptyMessage: "No reactions." })}
+    </section>
+  `;
+}
+
+function reportGenesSectionHtml() {
+  const genes = DATA.genes || [];
+  const top = [...genes].sort((a, b) => b.reaction_count - a.reaction_count).slice(0, 15).map(g => ({ label: g.name ? `${g.id} (${g.name})` : g.id, value: g.reaction_count }));
+  return `
+    <section class="report-section">
+    <h2 id="sec-genes">Genes</h2>
+    ${reportStatusStack(genes.map(g => ({ f: g.lost_on_ko.length ? "deletion disables a reaction" : "no reaction depends on it alone" })), "f", "Genes by effect of a single deletion", { "deletion disables a reaction": "var(--s2)", "no reaction depends on it alone": "var(--s1)" })}
+    ${rcHist(genes.map(g => g.reaction_count), { title: "Reactions per gene", xLabel: "number of reactions", bins: 15 })}
+    ${rcBars(top, { title: "Genes with the most reactions (top 15)" })}
+    ${staticTableHtml(GENE_TABLE_COLUMNS, genes, { emptyMessage: "This model has no genes defined." })}
+    </section>
+  `;
+}
+
+function reportBalanceSectionHtml(data) {
+  const c = data.counts || {};
+  return `
+    <section class="report-section">
+    <h2 id="sec-balance">Reaction balance</h2>
+    ${rcStack(Object.keys(c).map(k => ({ label: k, value: c[k], color: BALANCE_COLORS[k] || "var(--s-other)" })), { title: "Reactions by balance status" })}
+    ${staticTableHtml([{ key: "id", label: "Reaction" }, { key: "name", label: "Name" }, { key: "status", label: "Status" }, { key: "problem", label: "Problem" }],
+      data.reactions || [], { emptyMessage: "Every checkable reaction is balanced." })}
+    </section>
+  `;
+}
+
+function reportQualitySectionHtml(report) {
+  const m = report.models[0];
+  const rows = report.columns.map(c => ({ k: c.label, v: reportCell(m.metrics[c.key]) }));
+  const t = REPORT_THRESHOLDS;
+  return `
+    <section class="report-section">
+    <h2 id="sec-quality">Quality findings</h2>
+    <div class="report-meta">Thresholds: growth ${t.mu_min}–${t.mu_max} 1/h, blocked reactions &gt; ${t.blocked_warn_pct}%, dead-end metabolites &gt; ${t.deadend_warn_pct}%.</div>
+    ${m.findings.length
+      ? `<ul class="finding-list">${m.findings.map(f => `<li>${escapeHtml(f)}</li>`).join("")}</ul>`
+      : `<div class="report-note">No threshold violations.</div>`}
+    <h3>Key statistics</h3>
+    ${staticTableHtml([{ key: "k", label: "Statistic" }, { key: "v", label: "Value" }], rows)}
     </section>
   `;
 }
@@ -3153,8 +2649,17 @@ function reportObjectiveSectionHtml() {
   `;
 }
 
+function reportExchangesCharts() {
+  const tested = (DATA.exchanges || []).filter(e => e.ko_growth_fraction !== null && e.ko_growth_fraction !== undefined);
+  if (!tested.length) return "";
+  const lowest = [...tested].sort((a, b) => a.ko_growth_fraction - b.ko_growth_fraction).slice(0, 20)
+    .map(e => ({ label: e.id, value: Math.round(1000 * e.ko_growth_fraction) / 10, color: e.essential ? "var(--s2)" : "var(--s1)" }));
+  return reportStatusStack(tested.map(e => ({ f: e.essential ? "essential" : "not essential" })), "f", "Exchanges by essentiality", { essential: "var(--s2)", "not essential": "var(--s1)" }) +
+    rcBars(lowest, { title: "Growth retained after knocking out each exchange (% of WT, 20 lowest)", unit: "%", note: "Orange bars are essential exchanges (growth below 5% of WT)." });
+}
+
 function reportExchangesSectionHtml() {
-  return `<section class="report-section"><h2 id="sec-exchanges">Exchange essentiality</h2>${staticTableHtml(EXCHANGE_TABLE_COLUMNS, DATA.exchanges || [], { emptyMessage: "No exchange data (essentiality test may not have finished yet)." })}</section>`;
+  return `<section class="report-section"><h2 id="sec-exchanges">Exchange essentiality</h2>${reportExchangesCharts()}${staticTableHtml(EXCHANGE_TABLE_COLUMNS, DATA.exchanges || [], { emptyMessage: "No exchange data (essentiality test may not have finished yet)." })}</section>`;
 }
 
 function reportMinimalMediumSectionHtml(data) {
@@ -3162,6 +2667,8 @@ function reportMinimalMediumSectionHtml(data) {
     <section class="report-section">
     <h2 id="sec-minmed">Minimal medium</h2>
     <div class="report-note">${escapeHtml(data.note || "")}</div>
+    ${rcBars((data.components || []).map(c => ({ label: c.metabolite_name || c.exchange_id, value: Math.abs(c.uptake_flux || 0) })).sort((a, b) => b.value - a.value).slice(0, 25),
+      { title: "Uptake flux of each minimal-medium component (top 25)", unit: "mmol/gDW/h" })}
     ${staticTableHtml(MINMED_CSV_COLUMNS, data.components || [], { emptyMessage: "No components." })}
     </section>
   `;
@@ -3172,6 +2679,13 @@ function reportNetworkGapsSectionHtml(data) {
     <section class="report-section">
     <h2 id="sec-gaps">Network gaps</h2>
     <div class="report-note">${escapeHtml(data.note || "")}</div>
+    ${rcStack([
+      { label: "blocked", value: (data.blocked_reactions || []).length, color: "var(--s2)" },
+      { label: "can carry flux", value: Math.max(0, DATA.stats.reactions - (data.blocked_reactions || []).length), color: "var(--s1)" },
+    ], { title: "Reactions that can carry flux" })}
+    ${rcBars(rcCountBy(data.blocked_reactions || [], r => r.subsystem, 12), { title: "Blocked reactions per subsystem (top 12)" })}
+    ${rcBars(rcCountBy(data.blocked_reactions || [], r => r.class_label, 12), { title: "Blocked reactions: linked to a dead end or not" })}
+    ${rcBars(rcCountBy(data.dead_end_metabolites || [], d => d.class_label, 12), { title: "Dead-end metabolites by class" })}
     <h3>Blocked reactions</h3>
     ${staticTableHtml(NETGAPS_BLOCKED_CSV_COLUMNS, data.blocked_reactions || [], { emptyMessage: "No blocked reactions." })}
     <h3>Dead-end metabolites</h3>
@@ -3185,6 +2699,7 @@ function reportDemandSinkSectionHtml(data) {
     <section class="report-section">
     <h2 id="sec-dsaudit">Demand &amp; sink audit</h2>
     <div class="report-note">${escapeHtml(data.note || "")}</div>
+    ${reportStatusStack((data.rows || []).map(r => ({ f: `${r.kind}${r.essential ? " (essential)" : ""}` })), "f", "Demand and sink reactions")}
     ${staticTableHtml(DSAUDIT_CSV_COLUMNS, data.rows || [], { emptyMessage: "No demand or sink reactions." })}
     </section>
   `;
@@ -3228,6 +2743,32 @@ async function runGenerateReport(getPath) {
 
     // Overview / Metabolites / Reactions / Objective / Exchanges are already
     // in memory from the initial analysis -- no re-fetch needed.
+    const wantExcel = !!($("reportExcel") && $("reportExcel").checked);
+    if (wantSections.quality || wantExcel) {
+      setStatus("Computing key statistics and findings…");
+      const t = REPORT_THRESHOLDS;
+      const res = await fetch("/api/model-report", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: MODEL_ID, mu_min: t.mu_min, mu_max: t.mu_max, blocked_warn_pct: t.blocked_warn_pct,
+          deadend_warn_pct: t.deadend_warn_pct, essentiality: "1", minimal_medium: "1", network_gaps: "1", demand_sink: "1", balance: "1" }),
+      });
+      let qualityReport = null;
+      await readNdjson(res, ev => {
+        if (ev.type === "error") throw new Error(ev.error);
+        if (ev.type === "complete") qualityReport = ev.report;
+      });
+      if (!qualityReport) throw new Error("The quality analysis ended without a result.");
+      if (wantSections.quality) {
+        sectionsHtml.push(reportQualitySectionHtml(qualityReport));
+        tocEntries.push(["quality", "Quality findings"]);
+      }
+      if (wantExcel) {
+        const a = document.createElement("a");
+        a.href = `/api/model-report/${encodeURIComponent(MODEL_ID)}/download?format=xlsx`;
+        a.download = "model_report.xlsx";
+        document.body.appendChild(a); a.click(); a.remove();
+      }
+    }
     if (wantSections.overview) {
       sectionsHtml.push(reportOverviewSectionHtml());
       tocEntries.push(["overview", "Overview"]);
@@ -3240,6 +2781,10 @@ async function runGenerateReport(getPath) {
       sectionsHtml.push(reportReactionsSectionHtml());
       tocEntries.push(["reactions", "Reactions"]);
     }
+    if (wantSections.genes) {
+      sectionsHtml.push(reportGenesSectionHtml());
+      tocEntries.push(["genes", "Genes"]);
+    }
     if (wantSections.objective) {
       sectionsHtml.push(reportObjectiveSectionHtml());
       tocEntries.push(["objective", "Objective"]);
@@ -3247,6 +2792,14 @@ async function runGenerateReport(getPath) {
     if (wantSections.exchanges) {
       sectionsHtml.push(reportExchangesSectionHtml());
       tocEntries.push(["exchanges", "Exchange essentiality"]);
+    }
+    if (wantSections.balance) {
+      setStatus("Checking reaction balance…");
+      const res = await fetch("/api/balance-diagnostics", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: MODEL_ID }) });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || "Balance check failed.");
+      sectionsHtml.push(reportBalanceSectionHtml(data));
+      tocEntries.push(["balance", "Reaction balance"]);
     }
     if (wantSections.minimal_medium) {
       let data = MINMED_RESULT;
@@ -3299,12 +2852,21 @@ async function runGenerateReport(getPath) {
       tocEntries.push(["tracer", "Pathway tracer"]);
     }
     if (wantSections.frog) {
-      setStatus("Running FROG report (this can take a while for large models)…");
       const fraction = parseFloat(($("reportFrogFraction") || {}).value) || 1.0;
       const includeFva = $("reportFrogFva") ? $("reportFrogFva").checked : true;
       const includeRxnDel = $("reportFrogRxnDel") ? $("reportFrogRxnDel").checked : true;
       const includeGeneDel = $("reportFrogGeneDel") ? $("reportFrogGeneDel").checked : true;
-      const frogData = await runFrogReportForModal(fraction, includeFva, includeRxnDel, includeGeneDel, setStatus);
+      const wantedKey = new URLSearchParams({
+        fva_fraction: String(fraction),
+        include_fva: includeFva ? "1" : "0",
+        include_reaction_deletions: includeRxnDel ? "1" : "0",
+        include_gene_deletions: includeGeneDel ? "1" : "0",
+      }).toString();
+      let frogData = FROG_RESULT && FROG_PARAMS === wantedKey ? FROG_RESULT : null; // same settings already run in the FROG tab
+      if (!frogData) {
+        setStatus("Running FROG report (this can take a while for large models)…");
+        frogData = await runFrogReportForModal(fraction, includeFva, includeRxnDel, includeGeneDel, setStatus);
+      }
       sectionsHtml.push(buildFrogSectionBody(frogData));
       tocEntries.push(["frog", "FROG report"]);
     }
@@ -3316,7 +2878,7 @@ async function runGenerateReport(getPath) {
     const s = DATA.stats || {};
     const coverStats = [
       ["Genes", s.genes], ["Metabolites", s.metabolites], ["Reactions", s.reactions],
-      ["Compartments", s.compartments], ["WT growth", fmt(DATA.wt_growth)],
+      ["Compartments", s.compartments], ["WT growth", `${fmt(DATA.wt_growth)} h⁻¹`],
       ["Gene : Reaction ratio", s.reaction_gene_ratio != null ? `1 : ${fmt(s.reaction_gene_ratio, 2)}` : "—"],
     ];
     const body = `
@@ -3377,7 +2939,13 @@ function memoteTargetTab(name) {
 function memoteStageText(st) {
   if (st.stage === "retrying") return "The solver stopped unexpectedly; retrying with the exact (slower) solver…";
   if (st.stage === "rendering") return "Building the report…";
-  if (st.stage === "testing" && st.total) return `Running check ${Math.min(st.done + 1, st.total)} of ${st.total}${st.current ? " — " + st.current.replace(/^test_/, "").replace(/_/g, " ") : ""}`;
+  if (st.stage === "testing" && st.total) {
+    // `running` is the test in progress; `current` is the last one that finished.
+    const name = (st.running || st.current || "").replace(/^test_/, "").replace(/_/g, " ");
+    const skipped = (st.skipped || []).length
+      ? ` (skipped for taking too long: ${st.skipped.map(n => n.replace(/^test_/, "").replace(/_/g, " ")).join(", ")})` : "";
+    return `Running check ${Math.min(st.done + 1, st.total)} of ${st.total}${name ? " — " + name : ""}${skipped}. A check that makes no progress for 3 minutes is skipped automatically.`;
+  }
   return "Loading the model…";
 }
 
@@ -3429,7 +2997,7 @@ function memoteResultHtml(r) {
   return `
     <div class="memote-score">
       <div><div class="memote-score-num" style="color:${memoteScoreColor(total || 0)}">${memotePct(total)}</div>
-        <div class="mini-stat-label">MEMOTE total score</div></div>
+        <div class="mini-stat-label">MEMOTE total score${(m.skipped_slow_tests || []).length ? " (partial)" : ""}</div></div>
       <div class="memote-bars">${bars}</div>
     </div>
     <div class="chip-row" style="margin-bottom:12px;">
@@ -3439,6 +3007,7 @@ function memoteResultHtml(r) {
       <span class="badge skip">${r.counts.skipped} skipped</span>
       <span class="stoich">MEMOTE ${escapeHtml(m.memote_version || "")} · ${escapeHtml(m.duration_seconds)} s</span>
     </div>
+    ${(m.skipped_slow_tests || []).length ? `<div class="warn-box"><strong>Partial score.</strong> ${m.skipped_slow_tests.length} check(s) took too long and were left out, so they are neither passed nor failed and the total above is not for the full suite (it may be higher than the real score): ${m.skipped_slow_tests.map(n => escapeHtml(n.replace(/^test_/, "").replace(/_/g, " "))).join(", ")}.</div>` : ""}
     <h4 style="margin:14px 0 8px;">Needs attention <span class="stoich">(scored checks, largest impact on the score first)</span></h4>
     ${shown.length ? shown.map(memoteIssueHtml).join("") : '<div class="note" style="background:#ecfdf5;border-color:#a7f3d0;color:#047857;">No scored checks flagged an issue.</div>'}
     ${issues.length > 8 ? `<button type="button" class="secondary" data-memote-toggle="1">${MEMOTE_SHOW_ALL ? "Show fewer" : `Show all ${issues.length}`}</button>` : ""}
@@ -3473,10 +3042,12 @@ function renderMemoteBox() {
   } else if (st && st.status === "done" && st.result) {
     body = memoteResultHtml(st.result);
   } else {
-    const msg = st && st.status === "error" ? `<div class="error" style="margin-bottom:10px;white-space:pre-wrap;">${escapeHtml(st.error || "MEMOTE failed.")}</div>`
+    const msg = st && st.status === "error" ? `<div class="error" style="margin-bottom:10px;"><strong>MEMOTE did not run.</strong><pre style="white-space:pre-wrap;max-height:260px;overflow:auto;margin:6px 0 0;font-size:12px;">${escapeHtml(st.error || "MEMOTE failed.")}</pre></div>`
       : st && st.status === "cancelled" ? `<div class="note">The run was cancelled.</div>` : "";
     body = `${hint}${msg}<div class="memote-actions"><button type="button" data-memote-run="1">Run MEMOTE</button>
-      <span class="stoich">Takes from under a minute to several minutes depending on model size.</span></div>`;
+      <span class="stoich">Takes from under a minute to several minutes depending on model size.</span>
+      <button type="button" class="secondary" data-memote-test="1">Test MEMOTE setup</button></div>
+      <pre id="memoteTestOut" class="hidden" style="white-space:pre-wrap;font-size:12px;background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-top:10px;max-height:220px;overflow:auto;"></pre>`;
   }
   box.innerHTML = `
     <div class="memote-card">
@@ -3490,6 +3061,15 @@ function renderMemoteBox() {
     </div>`;
   box.querySelector("[data-memote-run]")?.addEventListener("click", startMemote);
   box.querySelector("[data-memote-rerun]")?.addEventListener("click", startMemote);
+  box.querySelector("[data-memote-test]")?.addEventListener("click", async (ev) => {
+    const out = $("memoteTestOut");
+    out.classList.remove("hidden");
+    out.textContent = "Testing…";
+    try {
+      const r = await (await fetch("/api/memote-selftest")).json();
+      out.textContent = (r.ok ? "OK — MEMOTE can be used by this app.\n\n" : "MEMOTE cannot be loaded by this app.\n\n") + r.output;
+    } catch (err) { out.textContent = "Could not run the test: " + err.message; }
+  });
   box.querySelector("[data-memote-cancel]")?.addEventListener("click", cancelMemote);
   box.querySelector("[data-memote-toggle]")?.addEventListener("click", () => { MEMOTE_SHOW_ALL = !MEMOTE_SHOW_ALL; renderMemoteBox(); });
   box.querySelectorAll("[data-goto]").forEach(b => b.addEventListener("click", ev => {
@@ -3556,15 +3136,14 @@ async function cancelMemote() {
 }
 
 $("memotePill").addEventListener("click", () => {
-  goToTab("overview");
-  $("memoteBox")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  goToTab("memote");
 });
 
 // ---------------------------------------------------------------------------
 // References
 // ---------------------------------------------------------------------------
 const REFERENCES = [
-  { name: "MEMOTE", why: "Model quality test suite run from the Overview page.",
+  { name: "MEMOTE", why: "Model quality test suite run from the MEMOTE tab.",
     cite: "Lieven C. et al. MEMOTE for standardized genome-scale metabolic model testing. Nature Biotechnology 38, 272–276 (2020).",
     links: [["Paper", "https://doi.org/10.1038/s41587-020-0446-y"], ["Documentation", "https://memote.readthedocs.io/"], ["Source code", "https://github.com/opencobra/memote"]] },
   { name: "COBRApy", why: "Model loading, constraint-based analysis (FBA, FVA, knockouts) and solver interface.",
@@ -3618,7 +3197,7 @@ function renderBalance() {
       A reaction is <strong>balanced</strong> when every element (and the net charge) adds up to the same on both sides.
       This tab lists reactions that are <strong>unbalanced</strong> (and by how much of which element) and those that
       <strong>can't be checked</strong> because a metabolite has no chemical formula. Exchange/demand/sink and biomass
-      reactions are skipped. Nothing is changed in the model.
+      reactions are skipped. Below the list, the audit suggests a fix for each one. Nothing is changed in the model.
     </div>
     <div class="toolbar">
       <button id="balRunBtn" type="button">Check reaction balance</button>
@@ -3632,7 +3211,9 @@ function renderBalance() {
     </div>
     <div id="balStatus" class="debug-status"></div>
     <div id="balResults"></div>
+    <div id="balanceaudit"></div>
   `;
+  renderBalanceAudit();
   $("balRunBtn").addEventListener("click", () => runBalance());
   $("balFilter").addEventListener("input", () => { BALANCE_FILTER = $("balFilter").value; drawBalance(); });
   $("balSearch").addEventListener("input", drawBalance);

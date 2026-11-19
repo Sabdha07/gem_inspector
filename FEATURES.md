@@ -42,8 +42,8 @@ A more general, flexible version of the tracing above: pick any starting point (
 
 Three checks aimed at spotting problems or leftover clutter in the model itself, rather than testing specific nutrients:
 
-- **Blocked reactions** — reactions that are simply incapable of ever being used, given the model's current settings — often a sign of a gap or missing connection in the model.
-- **Dead-end molecules** — molecules that can only ever be produced, or only ever be consumed, but never both — a common underlying cause of blocked reactions.
+- **Blocked reactions** — reactions that are simply incapable of ever being used, given the model's current settings. Each one is given a class saying why (caused by a dead end, the medium, a reaction direction, a cofactor, and so on), with a note on what to check. An optional slower test confirms the class with flux calculations.
+- **Dead-end molecules** — molecules that can only ever be produced, or only ever be consumed, but never both. Each is classed as a root gap or as inherited from one, and findings are grouped by root gap, so you can see which few gaps explain most of the blocked reactions. A shared, editable list of common cofactors (ATP, NADH, water…) keeps them from being treated as the cause of a gap.
 - **Demand & sink audit** — a review of a special category of "helper" reactions that modelers sometimes add by hand (distinct from normal nutrient exchanges). This flags ones that appear to be doing nothing, and ones that are quietly propping up the model's growth prediction and may deserve a second look.
 
 All three results can be exported to CSV.
@@ -61,3 +61,18 @@ All three results can be exported to CSV.
 - On-request MEMOTE run: background process, progress bar, cancel, auto-retry with `glpk_exact`, score and section scores, "needs attention" list linking to the relevant tab, full MEMOTE HTML report (open/download).
 - References tab: MEMOTE, COBRApy, Thiele & Palsson 2010, FROG/COMBINE, MetaNetX, libSBML, Cytoscape.js, GLPK.
 - ID namespace / annotation cards moved to Annotation & Translation > ID namespaces & annotation.
+
+## Compare Models tab
+
+Upload a second model and compare it with the loaded one. The naming conventions of both models (metabolite and reaction namespaces, compartment tags) are shown first, with whether they agree. Genes, metabolites, reactions and biomass components are then listed as shared, only in the first model, or only in the second. Each list can be copied to the clipboard or downloaded as CSV, with MetaNetX ids alongside the model ids.
+
+## SEED to VMH translation tab
+
+Translates a ModelSEED-namespace model to VMH ids using the translation tables in the data folder. Every metabolite and reaction is reported as mapped, as an error (ambiguous in the table, or the new id would clash with another), or as having no available mapping; each list can be copied or downloaded. The translated model (SBML and JSON) can be downloaded together with the report as one zip.
+
+## Reports, translation and audit
+
+- Compare Models: Excel and HTML reports; bounds and coefficient differences; pairing by equation.
+- Translate via MetaNetX: any namespace to MetaNetX, BiGG, VMH, ModelSEED, KEGG or MetaCyc.
+- Balance Audit: mapping and formula checks, verified fix suggestions, copy / CSV / Excel.
+- Model report (Overview) and Analyze multiple models (landing page): statistics, findings, Excel and HTML.

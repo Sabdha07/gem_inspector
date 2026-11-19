@@ -12,25 +12,27 @@ maximize, one per reaction for R, one per gene for G), whereas O is a
 single, near-instant solve. FVA's growth cutoff (fraction_of_optimum) is
 configurable, same as the Minimal Medium tab's cutoff.
 
-All the actual LP solving reuses cobra's own bulk analysis functions,
-forced to processes=1 (Windows "spawn" multiprocessing is fragile/slow to
-invoke from inside a live Flask request) and wrapped in
-run_with_exact_solver -- this class of repeated-solve computation is
-exactly what has been observed to crash GLPK's default solver on some
-Windows builds (see solver_utils.run_with_exact_solver).
+All the actual LP solving reuses cobra's own bulk analysis functions, with
+the worker-process count from core.solver_config (1 on Windows, where
+"spawn" multiprocessing is slow), wrapped in run_with_exact_solver -- this
+class of repeated-solve computation is what has been observed to crash
+GLPK's default solver on some Windows builds (see solver_utils).
 """
 import json
 
-from cobra.flux_analysis import flux_variability_analysis, single_gene_deletion, single_reaction_deletion
+from cobra.flux_analysis import flux_variability_analysis, single_gene_deletion
 
-from core.shared import find_biomass_reaction, safe_float
+from core.knockouts import reaction_knockout
+from core.memo import remember
+from core.shared import find_biomass_reaction, safe_float, wt_solution as solve_wt
+from core.solver_config import processes
 from diagnostics.solver_utils import run_with_exact_solver
 
 
 def compute_frog_objective(model):
     """The 'O' in FROG: a single FBA optimum under the model's current
     bounds (whatever diet was applied at upload)."""
-    solution = model.optimize()
+    solution = solve_wt(model)
     return {
         "objective_reaction": find_biomass_reaction(model),
         "status": str(solution.status),
@@ -39,6 +41,15 @@ def compute_frog_objective(model):
 
 
 def compute_frog_fva(model, fraction_of_optimum=1.0):
+    """Memoized per model and fraction; see _compute_frog_fva."""
+    try:
+        fraction_of_optimum = float(fraction_of_optimum)
+    except (TypeError, ValueError):
+        fraction_of_optimum = 1.0
+    return remember(model, ("frog_fva", fraction_of_optimum), lambda: _compute_frog_fva(model, fraction_of_optimum))
+
+
+def _compute_frog_fva(model, fraction_of_optimum=1.0):
     """The 'F' in FROG: flux variability analysis on every reaction in the
     model at the given fraction_of_optimum (1.0 = fixed at the model's own
     maximum growth; lower values allow more flux variability)."""
@@ -51,7 +62,7 @@ def compute_frog_fva(model, fraction_of_optimum=1.0):
     df = run_with_exact_solver(
         model,
         lambda: flux_variability_analysis(
-            model, reaction_list=None, fraction_of_optimum=fraction_of_optimum, processes=1,
+            model, reaction_list=None, fraction_of_optimum=fraction_of_optimum, processes=processes(),
         ),
     )
     rows = [
@@ -63,27 +74,34 @@ def compute_frog_fva(model, fraction_of_optimum=1.0):
 
 
 def compute_frog_reaction_deletions(model):
+    return remember(model, "frog_reaction_deletions", lambda: _compute_frog_reaction_deletions(model))
+
+
+def _compute_frog_reaction_deletions(model):
     """The 'R' in FROG: single-reaction-deletion objective value for every
     reaction in the model (not just exchanges -- unlike the Exchange
     Essentiality tab, this is every reaction, per the FROG standard)."""
-    if not model.reactions:
-        return {"reactions": []}
-    df = run_with_exact_solver(model, lambda: single_reaction_deletion(model, processes=1))
-    rows = []
-    for _, row in df.iterrows():
-        ids = row["ids"]
-        rxn_id = next(iter(ids)) if ids else None
-        rows.append({"id": rxn_id, "growth": safe_float(row["growth"]), "status": str(row["status"])})
-    rows.sort(key=lambda r: (r["id"] is None, r["id"]))
+    # Shared with exchange essentiality and the demand/sink audit: knockouts
+    # they already did are not solved again.
+    def run():
+        return [{"id": rxn.id, "growth": value, "status": status}
+                for rxn in model.reactions for value, status in [reaction_knockout(model, rxn)]]
+
+    rows = run_with_exact_solver(model, run) if model.reactions else []
+    rows.sort(key=lambda r: r["id"])
     return {"reactions": rows}
 
 
 def compute_frog_gene_deletions(model):
+    return remember(model, "frog_gene_deletions", lambda: _compute_frog_gene_deletions(model))
+
+
+def _compute_frog_gene_deletions(model):
     """The 'G' in FROG: single-gene-deletion objective value for every gene
     in the model."""
     if not model.genes:
         return {"genes": []}
-    df = run_with_exact_solver(model, lambda: single_gene_deletion(model, processes=1))
+    df = run_with_exact_solver(model, lambda: single_gene_deletion(model, processes=processes()))
     rows = []
     for _, row in df.iterrows():
         ids = row["ids"]

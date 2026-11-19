@@ -2,43 +2,27 @@
 (minimal medium, blocked reactions, FROG's F/R/G) -- see run_with_exact_solver.
 """
 
+import sys
 
-def run_with_exact_solver(model, fn):
-    """Run fn() with the model's solver temporarily switched to GLPK's
-    exact-arithmetic interface ("glpk_exact"), then always switch back to
-    whatever interface the model was using before -- even if fn() raises.
 
-    Why: cobra.medium.minimal_medium's open_exchanges=True path force-opens
-    every exchange reaction to (-1000, 1000), which for a genome-scale model
-    with a wide range of stoichiometric coefficients can produce a very
-    poorly scaled LP. The default GLPK solver runs a floating-point
-    scaling/factorization step for problems like that, and on some GLPK
-    builds (seen on Windows) a badly-scaled problem can trigger a fatal,
-    unrecoverable crash in GLPK's own memory allocator ("glp_free: memory
-    allocation error") -- a C-level abort that takes the whole Python
-    process down with it, so no amount of try/except around the call can
-    catch it. glpk_exact uses exact rational arithmetic and skips
-    floating-point scaling entirely, avoiding that failure mode (cobra's own
-    minimal_medium docs list "switching to a different solver" as the
-    recommended remedy for numerical instability here). It's slower, so
-    it's only used for the specific computation passed in, not globally.
-    """
+def _current_solver(model):
     try:
-        original = model.solver.interface.__name__.split(".")[-1].split("_interface")[0]
+        return model.solver.interface.__name__.split(".")[-1].split("_interface")[0]
     except Exception:
-        original = None
+        return None
 
-    if original == "glpk_exact":
-        return fn()
 
+def _with_solver(model, name, fn):
+    """Run fn() with the model on solver `name`, then restore the original
+    (even if fn raises). Runs as-is when `name` is unavailable."""
+    original = _current_solver(model)
     switched = False
-    if original is not None:
+    if original is not None and original != name:
         try:
-            model.solver = "glpk_exact"
+            model.solver = name
             switched = True
         except Exception:
-            switched = False  # glpk_exact unavailable -- fall back to running as-is
-
+            pass
     try:
         return fn()
     finally:
@@ -47,3 +31,51 @@ def run_with_exact_solver(model, fn):
                 model.solver = original
             except Exception:
                 pass
+
+
+def run_with_exact_solver(model, fn):
+    """Run fn() on GLPK's exact-arithmetic interface when the model uses
+    plain GLPK on Windows, otherwise unchanged (the crash is Windows-only and
+    exact arithmetic is several times slower).
+
+    Why: on badly scaled genome-scale LPs (e.g. exchanges opened to +-1000)
+    some GLPK builds (seen on Windows) abort inside glp_free, taking the whole
+    Python process down, which no try/except can catch. glpk_exact skips the
+    floating-point scaling and avoids this, at some cost in speed. Gurobi,
+    CPLEX and HiGHS do not have this problem, so they are left alone.
+    """
+    if _current_solver(model) != "glpk" or sys.platform != "win32":
+        return fn()
+    return _with_solver(model, "glpk_exact", fn)
+
+
+def run_with_milp_solver(model, fn):
+    """Run fn() on a solver that can handle integer variables (the chosen
+    one if it can, else the best available)."""
+    from core.solver_config import milp_solver_name
+    return _with_solver(model, milp_solver_name(), fn)
+
+
+# A target equal to the model's own optimum sits exactly on the solver's
+# feasibility tolerance, so a 100% cutoff can come back "infeasible" through
+# round-off alone. Asking for this fraction less is indistinguishable
+# biologically and removes that failure.
+GROWTH_TOLERANCE = 1e-6
+
+
+def solve_minimal_medium(model, target_growth, minimize_components=False):
+    """cobra.medium.minimal_medium with the robustness fixes in one place.
+
+    - target_growth is relaxed by GROWTH_TOLERANCE (see above).
+    - The LP (minimize total flux) runs on the exact GLPK solver; the MILP
+      (minimize_components=True) runs on a MILP-capable solver, because
+      glpk_exact (and HiGHS via scipy) have no integer variables.
+    Returns cobra's Series, or None when infeasible.
+    """
+    from cobra.medium import minimal_medium
+
+    def solve():
+        return minimal_medium(model, target_growth * (1 - GROWTH_TOLERANCE),
+                              minimize_components=minimize_components, open_exchanges=True)
+
+    return run_with_milp_solver(model, solve) if minimize_components else run_with_exact_solver(model, solve)

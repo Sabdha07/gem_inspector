@@ -10,7 +10,10 @@ share exactly the same tracing logic without drifting apart.
 """
 from collections import deque
 
-from annotation.naming import clean_metabolite_display_name, compartment_display_name, is_trivial_metabolite
+from annotation.naming import (
+    TRIVIAL_METABOLITES, clean_metabolite_display_name, compartment_display_name, is_trivial_metabolite,
+    metabolite_base_id,
+)
 from core.shared import classify_reactions, clean, safe_float, subsystem_value
 
 
@@ -38,11 +41,11 @@ def build_active_flux_downstream_graph(model, active_flux, flux_tolerance, trivi
         flux = active_flux[rxn.id]
 
         if flux > 0:
-            substrates = [met for met, coeff in rxn.metabolites.items() if coeff < -flux_tolerance]
-            products = [met for met, coeff in rxn.metabolites.items() if coeff > flux_tolerance]
+            substrates = [met for met, coeff in rxn.metabolites.items() if coeff < 0]
+            products = [met for met, coeff in rxn.metabolites.items() if coeff > 0]
         else:
-            substrates = [met for met, coeff in rxn.metabolites.items() if coeff > flux_tolerance]
-            products = [met for met, coeff in rxn.metabolites.items() if coeff < -flux_tolerance]
+            substrates = [met for met, coeff in rxn.metabolites.items() if coeff > 0]
+            products = [met for met, coeff in rxn.metabolites.items() if coeff < 0]
 
         for substrate in substrates:
             if substrate.id in trivial_ids:
@@ -55,12 +58,16 @@ def build_active_flux_downstream_graph(model, active_flux, flux_tolerance, trivi
     return downstream
 
 
-def bfs_flux_paths(downstream, start_met_id, is_target, max_paths=20, max_depth=20):
+def bfs_flux_paths(downstream, start_met_id, is_target, max_paths=20, max_depth=20, seen_sequences=None):
     """BFS from start_met_id over the `downstream` graph until `is_target`
     (a function of the current metabolite id) is true -- that node's path is
     recorded and not expanded further -- or max_paths/max_depth is reached. A
     reaction id is never revisited within the same path, which rules out
-    cycles. Returns a list of paths, each a list of (reaction_id,
+    cycles. Two paths made of the same reactions in the same order count once
+    (a reaction with several products that all lead to the target would
+    otherwise show up as several identical paths); pass a shared
+    `seen_sequences` set to apply this across several starting points too.
+    Returns a list of paths, each a list of (reaction_id,
     next_metabolite_id) hops starting from start_met_id (an empty list means
     start_met_id itself already satisfies is_target).
     """
@@ -68,6 +75,7 @@ def bfs_flux_paths(downstream, start_met_id, is_target, max_paths=20, max_depth=
     queue.append((start_met_id, []))
     visited = set()
     paths = []
+    seen_sequences = set() if seen_sequences is None else seen_sequences
 
     while queue and len(paths) < max_paths:
         current_met, path = queue.popleft()
@@ -81,7 +89,10 @@ def bfs_flux_paths(downstream, start_met_id, is_target, max_paths=20, max_depth=
         visited.add(state)
 
         if is_target(current_met):
-            paths.append(path)
+            sequence = tuple(rxn_id for rxn_id, _ in path)
+            if sequence not in seen_sequences:
+                seen_sequences.add(sequence)
+                paths.append(path)
             continue
 
         for rxn_id, next_met in downstream.get(current_met, []):
@@ -93,7 +104,7 @@ def bfs_flux_paths(downstream, start_met_id, is_target, max_paths=20, max_depth=
     return paths
 
 
-def format_flux_path(model, solution, start_met, path, reaction_types=None, compartment_names=None):
+def format_flux_path(model, solution, start_met, path, reaction_types=None, compartment_names=None, extra=None):
     """Render a BFS path (a list of (reaction_id, next_metabolite_id) hops
     starting from start_met) as {"metabolites": [...], "reactions": [...]}
     with display names and per-step flux/subsystem -- used by both the text
@@ -111,6 +122,11 @@ def format_flux_path(model, solution, start_met, path, reaction_types=None, comp
     and pass them in, since they only depend on model structure, not on the
     path being formatted -- computed on the fly here (once per call) when
     omitted, so existing callers are unaffected.
+
+    `extra` is an optional set of lower-case metabolite ids (full, or without
+    the compartment suffix) the user wants shown along the way: each path
+    reaction lists, as "side_metabolites", the ones it consumes or produces
+    that are not already the hop's own metabolites (one hop off the path).
     """
     if reaction_types is None:
         reaction_types = classify_reactions(model)
@@ -127,10 +143,21 @@ def format_flux_path(model, solution, start_met, path, reaction_types=None, comp
             "charge": clean(getattr(met, "charge", None)),
         }
 
+    def side_metabolites(rxn, flux, hop_ids):
+        side = []
+        for met, coeff in rxn.metabolites.items():
+            if met.id in hop_ids or not (met.id.lower() in extra or metabolite_base_id(met.id).lower() in extra):
+                continue
+            role = "substrate" if (coeff < 0) == (flux >= 0) else "product"  # zero flux reads forwards
+            side.append(dict(met_info(met), role=role))
+        return side
+
     formatted = {
         "metabolites": [met_info(start_met)],
         "reactions": [],
     }
+    extra = extra or set()
+    previous_met = start_met.id
     for rxn_id, next_met in path:
         rxn = model.reactions.get_by_id(rxn_id)
         flux = solution.fluxes[rxn_id]
@@ -147,8 +174,10 @@ def format_flux_path(model, solution, start_met, path, reaction_types=None, comp
             "upper_bound": safe_float(rxn.upper_bound),
             "reversible": bool(rxn.lower_bound < 0 and rxn.upper_bound > 0),
             "gene_reaction_rule": getattr(rxn, "gene_reaction_rule", ""),
+            "side_metabolites": side_metabolites(rxn, flux, {previous_met, next_met}) if extra else [],
         })
         formatted["metabolites"].append(met_info(next_met_obj))
+        previous_met = next_met
     return formatted
 
 
@@ -173,9 +202,9 @@ def resolve_reaction_start_metabolites(model, reaction_id, solution, flux_tolera
         )
 
     if flux > 0:
-        products = [met for met, coeff in rxn.metabolites.items() if coeff > flux_tolerance]
+        products = [met for met, coeff in rxn.metabolites.items() if coeff > 0]
     else:
-        products = [met for met, coeff in rxn.metabolites.items() if coeff < -flux_tolerance]
+        products = [met for met, coeff in rxn.metabolites.items() if coeff < 0]
 
     return products, None
 
@@ -191,6 +220,8 @@ def debug_exchange_to_biomass(
     exclude_trivial_metabolites=True,
     reaction_types=None,
     compartment_names=None,
+    solution=None,
+    currency=TRIVIAL_METABOLITES,
 ):
     """Trace active-flux pathways from an exchange-derived metabolite toward
     the biomass reaction. Only reactions carrying non-zero flux in the
@@ -207,12 +238,16 @@ def debug_exchange_to_biomass(
     straight through to format_flux_path (see there) -- a caller tracing
     several exchanges in one request computes these once up front rather
     than recomputing them for every exchange's before/after-KO trace.
+
+    `solution` is an already-solved FBA solution for the model as it stands
+    (the "before KO" trace passes the one solved once for the whole request).
     """
     model.reactions.get_by_id(exchange_rxn_id)  # validate it exists before running FBA
     biomass = model.reactions.get_by_id(biomass_rxn_id)
     start_met = model.metabolites.get_by_id(internal_metabolite_id)
 
-    solution = model.optimize()
+    if solution is None:
+        solution = model.optimize()
     if solution.status != "optimal":
         return {"status": solution.status, "paths": [], "error": "FBA not optimal"}
 
@@ -224,14 +259,14 @@ def debug_exchange_to_biomass(
     if exclude_trivial_metabolites:
         trivial_ids = {
             met.id for met in model.metabolites
-            if met.id != start_met.id and is_trivial_metabolite(met)
+            if met.id != start_met.id and is_trivial_metabolite(met, currency)
         }
 
     downstream = build_active_flux_downstream_graph(model, active_flux, flux_tolerance, trivial_ids)
 
     def is_biomass_target(met_id):
         biomass_coeff = biomass.metabolites.get(model.metabolites.get_by_id(met_id), 0)
-        return biomass_coeff < -flux_tolerance
+        return biomass_coeff < 0
 
     paths = bfs_flux_paths(downstream, start_met.id, is_biomass_target, max_flux_paths, max_flux_path_depth)
     formatted_paths = [
@@ -254,6 +289,7 @@ def run_pathway_trace(
     model, solution, start_type, start_id, target_met,
     max_levels, max_paths, exclude_trivial,
     flux_tolerance=1e-9, reaction_types=None, compartment_names=None,
+    currency=TRIVIAL_METABOLITES, extra=None,
 ):
     """Run one pass of the general pathway trace (resolve the start point,
     build the active-flux graph, BFS to the target, format the paths)
@@ -295,7 +331,7 @@ def run_pathway_trace(
         keep_ids = {target_met.id} | {m.id for m in start_metabolites}
         trivial_ids = {
             met.id for met in model.metabolites
-            if met.id not in keep_ids and is_trivial_metabolite(met)
+            if met.id not in keep_ids and is_trivial_metabolite(met, currency)
         }
 
     downstream = build_active_flux_downstream_graph(model, active_flux, flux_tolerance, trivial_ids)
@@ -304,12 +340,14 @@ def run_pathway_trace(
         return met_id == target_met.id
 
     all_paths = []
+    seen_sequences = set()
     for start_met in start_metabolites:
         if len(all_paths) >= max_paths:
             break
-        paths = bfs_flux_paths(downstream, start_met.id, is_target, max_paths - len(all_paths), max_levels)
+        paths = bfs_flux_paths(downstream, start_met.id, is_target, max_paths - len(all_paths), max_levels,
+                               seen_sequences)
         all_paths.extend(
-            format_flux_path(model, solution, start_met, path, reaction_types, compartment_names)
+            format_flux_path(model, solution, start_met, path, reaction_types, compartment_names, extra)
             for path in paths
         )
 
